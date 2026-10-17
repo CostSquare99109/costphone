@@ -1,0 +1,256 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#==============================================================================
+# amctl - App control toolkit for Termux
+# Drives the AccessDroid AccessibilityService (simulates clicks, scrolls,
+# type-into-field, UI-tree inspection) + am transport for app lifecycle.
+#
+# Prerequisites:
+#   1. AccessDroid APK built & installed (see bin/accessdroid/build.sh)
+#   2. Settings -> Accessibility -> AccessDroid  =>  ON
+#
+# Transport (auto-detected):
+#   "socket": termux-am AM socket (Termux app v0.119+). Full functionality.
+#   "am":     classic TermuxAm 'am' command (works on stable Termux v0.118.x).
+#             Everything works except pm-based commands, which need the socket:
+#             list / find / stop / info / perms / grant / revoke / clear.
+#
+# Usage: amctl <command> [args...]
+#   list     [query]            List 3rd-party apps (socket only)
+#   find     <name>             Search apps by label (socket only)
+#   launch   <app|pkg>          Launch an app (use package name without socket)
+#   stop     <app|pkg>          Force-stop an app (socket only)
+#   info     <app|pkg>          Package info (socket only)
+#   perms    <app|pkg>          List app permissions (socket only)
+#   grant    <app|pkg> <perm>   Grant a permission (socket only)
+#   revoke   <app|pkg> <perm>   Revoke a permission (socket only)
+#   clear    <app|pkg>          Clear app data/cache (socket only)
+#   tree                         Dump current UI tree -> /sdcard/Download/accessdroid-tree.txt
+#   snap     [-a] [--filter T]  Snapshot con refs @pN (estilo agent-browser snapshot -i)
+#   tapref   @pN [ms]           Tap on the element of that snap ref (re-snap tras cambios)
+#   see      [file]             Screenshot PNG -> /sdcard/Download/accessdroid-shot.png
+#   tap      X Y [ms]           Tap at (X,Y); optional hold duration
+#   longpress X Y [ms]          Long-press at (X,Y); default 500ms
+#   swipe    X1 Y1 X2 Y2 [ms]   Swipe/drag
+#   scroll   up|down [x y]      Scroll at position
+#   back                         Press back
+#   home                         Press home
+#   recents                      Open recents
+#   type     <text>             Type text into the focused field
+#   click    "text"             Click UI element by visible text
+#   clickid  resourceId          Click UI element by resource id
+#   scrollto "text"             Scroll to an element with text
+#   screenshot [file]          Screenshot PNG -> /sdcard/Download/accessdroid-shot.png
+#   presskey <key>               Press a key (back/home/recents only)
+#   help                        Show this help
+#==============================================================================
+
+set -u
+PROG="amctl"
+SECRET="termux-accessdroid-2025"
+PKG="com.accessdroid.termux"
+
+# ---- transport auto-detection: AM socket if available, else classic 'am' ----
+TRANSPORT="am"
+if command -v termux-am >/dev/null 2>&1 && termux-am get-current-user >/dev/null 2>&1; then
+    TRANSPORT="socket"
+fi
+
+# Run an AM command through the active transport.
+tam() {
+    if [[ "$TRANSPORT" == "socket" ]]; then
+        termux-am "$@"
+    else
+        am "$@"
+    fi
+}
+
+# Lifecycle commands (pm/force-stop) need the socket transport.
+need_socket() {
+    if [[ "$TRANSPORT" != "socket" ]]; then
+        echo "amctl $1: requiere el AM socket (app Termux v0.119+)." >&2
+        echo "En Termux estable funcionan: tap swipe longpress scroll type click" >&2
+        echo "clickid scrollto back home recents presskey screenshot y launch <package.name>" >&2
+        return 4
+    fi
+}
+
+# ---- send a raw broadcast to AccessDroid (always carries the secret) ----
+bc() {
+    # $1 = action, rest are --es/--ei/--el extras
+    local action="$1"; shift
+    tam broadcast -p "$PKG" -a "$action" --es secret "$SECRET" "$@" >/dev/null 2>&1
+}
+
+# ---- send a command to the AccessibilityService and report errors ----
+ac() {
+    local action="$1"; shift
+    if ! bc "$action" "$@"; then
+        echo "ERROR: failed to send command '$action'." >&2
+        echo "Is AccessDroid's accessibility service enabled?" >&2
+        echo "Settings -> Accessibility -> AccessDroid -> ON" >&2
+        return 3
+    fi
+}
+
+# ---- package resolution (substring match -> unique package) ----
+resolve_pkg() {
+    local input="$1"
+    [[ -z "$input" ]] && { echo "missing app/package argument" >&2; return 2; }
+    if [[ "$TRANSPORT" != "socket" ]]; then
+        if [[ "$input" == *.* ]]; then
+            echo "$input"; return 0
+        fi
+        echo "sin AM socket no hay busqueda por nombre: usa el package name completo (ej: com.android.chrome)" >&2
+        return 1
+    fi
+    if [[ "$input" == *.* ]]; then
+        if tam pm list packages 2>/dev/null | sed 's/^package://' | grep -qx "$input"; then
+            echo "$input"; return 0
+        fi
+    fi
+    local matches count
+    matches=$(tam pm list packages -f 2>/dev/null \
+        | sed 's/^package://' | awk -F'=' '{print $1}' | grep -i "$input" || true)
+    count=$(echo "$matches" | grep -c .)
+    if [[ "$count" -eq 0 ]]; then
+        echo "no package matching '$input'" >&2; return 1
+    elif [[ "$count" -gt 1 ]]; then
+        echo "'$input' matches:"; echo "$matches" >&2; return 1
+    fi
+    echo "$matches"; return 0
+}
+
+# ========================= subcommands =========================
+
+cmd_list() {
+    need_socket list || return $?
+    local q="${1:-}"
+    tam pm list packages -3 -f 2>/dev/null \
+        | sed 's/^package://' \
+        | if [[ -n "$q" ]]; then grep -i "$q"; else cat; fi \
+        | awk -F'=' '{printf "%-45s %s\n",$1,$2}'
+}
+
+cmd_find() {
+    need_socket find || return $?
+    local q="${1:-}"
+    [[ -z "$q" ]] && { echo "usage: amctl find <name>" >&2; return 2; }
+    command -v aapt2 >/dev/null && {
+        tam pm list packages -3 -f 2>/dev/null | sed 's/^package://' | while IFS='=' read -r pkg apk; do
+            local label
+            label=$(aapt2 dump badging "$apk" 2>/dev/null | sed -n "s/.*application-label:'(.*)'.app=//p" | head -1)
+            [[ -z "$label" ]] && label="(no label)"
+            if echo "$label $pkg" | grep -iq "$q"; then
+                printf "%-30s %s\n" "$label" "$pkg"
+            fi
+        done
+    } || cmd_list "$q"
+    return 0
+}
+
+cmd_launch() {
+    if [[ "$TRANSPORT" == "socket" ]]; then
+        local pkg; pkg=$(resolve_pkg "$1") || return $?
+        local comp
+        comp=$(tam cmd package resolve-activity --brief \
+            -c android.intent.category.LAUNCHER \
+            -a android.intent.action.MAIN "$pkg" 2>/dev/null \
+            | sed 's/^[^:]*: //' | head -1)
+        if [[ -n "$comp" ]]; then
+            tam start --user 0 -n "$comp" 2>/dev/null || { echo "launch failed for $pkg"; return 1; }
+            echo "Launched $pkg -> $comp"
+        else
+            tam monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 2>/dev/null \
+                && echo "Launched $pkg (monkey)" || { echo "launch failed for $pkg"; return 1; }
+        fi
+    else
+        local pkg="${1:-}"
+        if [[ "$pkg" != *.* ]]; then
+            echo "uso: amctl launch <package.name>   (sin socket no hay busqueda por nombre)" >&2
+            return 2
+        fi
+        if tam start --user 0 -a android.intent.action.MAIN \
+            -c android.intent.category.LAUNCHER -p "$pkg" >/dev/null 2>&1; then
+            echo "Launched $pkg"
+        elif bc com.accessdroid.termux.ACTION_START_ACTIVITY --es package "$pkg"; then
+            echo "Launched $pkg (via AccessDroid)"
+        else
+            echo "launch failed for $pkg" >&2
+            echo "(sin socket hay limite de visibilidad de paquetes: prueba el componente explicito: am start -n $pkg/.ActividadPrincipal)" >&2
+            return 1
+        fi
+    fi
+}
+
+cmd_stop()   { need_socket stop || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam force-stop "$pkg" 2>/dev/null && echo "Stopped $pkg" || { echo "stop failed"; return 1; }; }
+cmd_info()   { need_socket info || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam pm dump "$pkg" 2>/dev/null | grep -E 'versionCode|targetSdk|path|uid|minSdk' | head -8; }
+cmd_perms()  { need_socket perms || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam pm list permissions -g -p "$pkg" 2>/dev/null; }
+cmd_grant()  { need_socket grant || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; shift; local perm="$1"; tam pm grant "$pkg" "$perm" 2>/dev/null && echo "Granted $perm to $pkg"; }
+cmd_revoke() { need_socket revoke || return $?; local p; p=$(resolve_pkg "$1") || return $?; shift; local perm; tam pm revoke "${p}" "${1:-}" 2>/dev/null; }
+cmd_clear()  { need_socket clear || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam clear package "$pkg" 2>/dev/null && echo "Cleared $pkg"; }
+cmd_tree()   { local f=/sdcard/Download/accessdroid-tree.txt; rm -f "$f"; bc com.accessdroid.termux.ACTION_GET_UI_TREE; local ok=0; for i in 1 2 3 4 5; do sleep 1; [[ -f "$f" ]] && { ok=1; break; }; done; if [[ $ok == 1 ]]; then cat "$f"; else echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)"; return 1; fi; }
+cmd_snap()   { local f=/sdcard/Download/accessdroid-tree.txt; rm -f "$f"; bc com.accessdroid.termux.ACTION_GET_UI_TREE; local ok=0; for i in 1 2 3 4 5; do sleep 1; [[ -f "$f" ]] && { ok=1; break; }; done; [[ $ok == 1 ]] || { echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2; return 1; }; python3 "$HOME/bin/amctl-snap.py" "$@"; }
+
+cmd_tapref() {
+    local ref="${1:-}"
+    [[ -z "$ref" ]] && { echo "uso: amctl tapref @pN  (refs de 'amctl snap')" >&2; return 2; }
+    ref="${ref#@}"; [[ "$ref" != p* ]] && ref="p$ref"
+    local MAP="$HOME/.cache/amctl/snapshot-map.tsv"
+    [[ -f "$MAP" ]] || { echo "no hay snapshot — ejecuta: amctl snap" >&2; return 1; }
+    local line; line=$(awk -F'\t' -v r="$ref" '$1==r{print; exit}' "$MAP")
+    [[ -z "$line" ]] && { echo "ref @$ref no existe — re-ejecuta: amctl snap" >&2; return 1; }
+    local cx cy; cx=$(printf '%s' "$line" | cut -f2); cy=$(printf '%s' "$line" | cut -f3)
+    ac com.accessdroid.termux.ACTION_TAP --ei x "$cx" --ei y "$cy" --el duration "${2:-80}"
+    echo "tap @$ref -> ($cx,$cy)"
+}
+
+# input / UI subcommands (via AccessDroid)
+
+cmd_tap()        { ac com.accessdroid.termux.ACTION_TAP --ei x "${1:-0}" --ei y "${2:-0}" --el duration "${3:-80}"; }
+cmd_longpress()  { ac com.accessdroid.termux.ACTION_LONG_PRESS --ei x "${1:-0}" --ei y "${2:-0}" --el duration "${3:-500}"; }
+cmd_swipe()      { ac com.accessdroid.termux.ACTION_SWIPE --ei x1 "${1:-0}" --ei y1 "${2:-0}" --ei x2 "${3:-0}" --ei y2 "${4:-0}" --el duration "${5:-300}"; }
+cmd_scroll()     { local dir="${1:-down}"; [[ "$dir" == down ]] && ac com.accessdroid.termux.ACTION_SCROLL_DOWN --ei x "${2:-0}" --ei y "${3:-0}" \
+                    || ac com.accessdroid.termux.ACTION_SCROLL_UP --ei x "${2:-0}" --ei y "${3:-0}"; }
+cmd_back()       { bc com.accessdroid.termux.ACTION_BACK; }
+cmd_home()       { bc com.accessdroid.termux.ACTION_HOME; }
+cmd_recents()    { bc com.accessdroid.termux.ACTION_RECENTS; }
+cmd_type()       { bc com.accessdroid.termux.ACTION_TYPE --es text "$1"; }
+cmd_click()      { bc com.accessdroid.termux.ACTION_CLICK_TEXT --es text "$1"; }
+cmd_clickid()    { bc com.accessdroid.termux.ACTION_CLICK_ID --es id "$1"; }
+cmd_scrollto()   { bc com.accessdroid.termux.ACTION_SCROLL_TO --es text "$1"; }
+cmd_shot()       { local f="${1:-/sdcard/Download/accessdroid-shot.png}"; local i; rm -f "$f" 2>/dev/null; for i in 1 2 3; do bc com.accessdroid.termux.ACTION_SCREENDUMP; sleep 2; [[ -f "$f" ]] && break; done; if [[ -f "$f" ]]; then echo "PNG: $f ($(stat -c%s "$f") bytes)"; else echo "(no se guardo el PNG)"; if [[ -f /sdcard/Download/accessdroid-shot-error.txt ]]; then echo "error del servicio:"; cat /sdcard/Download/accessdroid-shot-error.txt; fi; fi; }
+cmd_presskey()   { local k="$1"; local code=0; case "$k" in back) code=4;; home) code=3;; recents) code=187;; *) echo "only back|home|recents supported" >&2; return 1;; esac; bc com.accessdroid.termux.ACTION_PRESS_KEY --ei keyCode "$code"; }
+
+# ========================= dispatcher =========================
+case "${1:-help}" in
+    list)      cmd_list "${2:-}" ;;
+    find)      cmd_find "${2:-}" ;;
+    launch)    cmd_launch "${2:-}" ;;
+    stop)      cmd_stop "${2:-}" ;;
+    info)      cmd_info "${2:-}" ;;
+    perms)     cmd_perms "${2:-}" ;;
+    grant)     cmd_grant "${2:-}" "${3:-}" ;;
+    revoke)    cmd_revoke "${2:-}" "${3:-}" ;;
+    clear)     cmd_clear "${2:-}" ;;
+    tree)      cmd_tree ;;
+    snap)      shift; cmd_snap "$@" ;;
+    tapref)    cmd_tapref "${2:-}" "${3:-}" ;;
+    tap)       cmd_tap "${2:-}" "${3:-}" "${4:-80}" ;;
+    longpress) cmd_longpress "${2:-0}" "${3:-0}" "${4:-500}" ;;
+    swipe)     cmd_swipe "${2:-0}" "${3:-0}" "${4:-0}" "${5:-0}" "${6:-300}" ;;
+    scroll)    cmd_scroll "${2:-down}" "${3:-0}" "${4:-0}" ;;
+    back)      cmd_back ;;
+    home)      cmd_home ;;
+    recents)   cmd_recents ;;
+    type)      cmd_type "${2:-}" ;;
+    click)     cmd_click "${2:-}" ;;
+    clickid)   cmd_clickid "${2:-}" ;;
+    scrollto)  cmd_scrollto "${2:-}" ;;
+    screenshot) cmd_shot "${2:-}" ;;
+    shot)      cmd_shot "${2:-}" ;;
+    see)       cmd_shot "${2:-}" ;;
+    presskey)  cmd_presskey "${2:-}" ;;
+    help|-h|--help)
+        awk '/^#====/{c++; if(c==2) exit} c>=1{print}' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) echo "unknown command: $1 (use 'amctl help')" >&2; exit 1 ;;
+esac

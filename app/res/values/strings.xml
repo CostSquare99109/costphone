@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CostPhone</string>
+    <string name="accessibility_service_description">Control remoto desde Termux: CostPhone lee la pantalla y ejecuta toques, gestos y texto por ti, solo cuando Tú se lo pides.</string>
+</resources>
