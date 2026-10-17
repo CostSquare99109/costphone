@@ -33,6 +33,10 @@ acción por ref: re-snapshot.
 | `amctl see` | Captura PNG → /sdcard/Download/accessdroid-shot.png (leerla con read: es una imagen) |
 
 El snapshot trae: ref, clase, texto, id corto y **coordenadas del centro**.
+Si el teclado o una barra flotante (Seleccionar todo/Pegar) están abiertos,
+sus elementos aparecen también como refs, marcados **[ime]** (teclado — Enter,
+borrar ⌫, stickers...), **[ovl]** (toolbar flotante) o **[sys]** (overlays del
+sistema). Ya no hay que adivinar coordenadas del teclado: Enter y ⌫ son refs.
 Cuando falla `see`, el motivo exacto queda en
 /sdcard/Download/accessdroid-shot-error.txt.
 
@@ -42,18 +46,29 @@ Cuando falla `see`, el motivo exacto queda en
 |---|---|
 | `amctl tapref @p3` | Toca el centro del elemento (ref del último snap) |
 | `amctl tap X Y` | Toque crudo en coordenadas (p.ej. de `snap -a`) |
+| `amctl tapshot X Y [W H]` | Toca coords vistas en el PNG del último `see` (W H = tamaño con el que viste la imagen); escalea a coords reales |
 | `amctl longpress X Y [ms]` | Pulsación larga |
 | `amctl swipe X1 Y1 X2 Y2 [ms]` | Deslizar/arrastrar |
 | `amctl scroll down\|up [x y]` | Scroll |
 | `amctl click "texto"` | Click por texto visible (fallback sin snapshot) |
 | `amctl clickid <id>` | Click por resource-id (p.ej. `com.whatsapp:id/send`) |
-| `amctl type "texto"` | Escribe en el campo con foco ([edt][FOCUS] en snap) |
+| `amctl type "texto"` | Escribe en el campo con foco ([edt][FOCUS] en snap). **REEMPLAZA todo el contenido** (setText), desconocido no appenda |
+| `amctl cleartext` | Vacía el campo con foco |
+| `amctl paste` | Pega el clipboard en el campo con foco |
+| `amctl focus "texto"` | Da foco a un campo por texto (o resource-id) |
+| `amctl openurl <url>` | Navega al URL en el Chrome default — SIN pelear con el omnibox (mejor que tap URL + type + Enter) |
+| `amctl float <texto> [pkg]` | Pon la app en ventana flotante (recents → long-press en tarjeta → "ventanas flotantes" de MIUI). `float X pkg Y split` = pantalla dividida. Si no está en recents, lánzala con pkg |
 | `amctl back` / `home` / `recents` | Botones del sistema |
 | `amctl launch <pkg>` | Abre app (terceros: vía servicio CostPhone) |
 | `amctl scrollto "texto"` | Busca y hace scroll a un texto |
 
 Para escribir: `tapref` al campo `[edt]` (o `clickid ...entry`) → `amctl type` →
 `tapref` al botón enviar (`'Enviar'` / `#send`) → `snap` para verificar.
+
+Para navegar (Chrome/otro navegador): SIEMPRE primero
+`amctl openurl "https://..."` — saltarse el omnibox evita autocompletados,
+Enter fallido a ciegas, y páginas erróneas. Solo recurrir a snap URL+type si
+openurl no existiera.
 
 ## Ejemplo real verificado (WhatsApp)
 
@@ -76,8 +91,26 @@ amctl snap                       # verificar que el mensaje salió
   comandos `list/find/stop/info/perms/grant/revoke/clear` (necesitan socket).
 - `launch` de apps de terceros va vía el servicio (hay límite de visibilidad de
   paquetes del `am` clásico). Si falla: `am start -n <pkg>/<Activity>` explícito.
-- El árbol exige el servicio activado: Ajustes → Accesibilidad → CostPhone ON,
-  y app >= v1.0.8 (versión con flags clk/scr/edt/foc y fix de captura).
+- `openurl`/`cleartext`/`paste`/`focus`/`tapshot` funcionan en ambos transportes.
+- El árbol exige el servicio activado: Ajustes → Accesibilidad → CostPhone ON.
+  Las refs [ime]/[ovl] requieren app >= v1.1 (dump multi-ventana). Con v1.0.x
+  el snap sigue funcionando pero sin elementos del teclado.
+
+## Recetas
+
+- **Navegar a una página:** `amctl openurl "https://github.com/user/repo/settings/access"`.
+  Nunca construir la navegación escribiendo en el omnibox (autocompletado + Enter ciego).
+- **Código de verificación GitHub (sudo mode) en Chrome:** Settings pide código →
+  `amctl launch com.google.android.gm` → `amctl snap` (el código suele venir
+  en el texto de la fila del correo GitHub, sin abrirlo) → volver con
+  `amctl launch com.android.chrome` → tap al campo → `amctl type "<código>"`.
+- **Formulario web largo / muchos campos en diálogos:** `snap` al campo [edt] → tapref →
+  si ya tiene texto: `amctl cleartext` (o directamente `type` que reemplaza).
+  Seleccionar todo/Pegar están en toolbars [ovl] cuando están visibles.
+- **Enter / borrar sin teclado físico:** con el teclado abierto, `amctl snap`
+  y buscar las refs [ime] (fila final: Enter y ⌫). Tapref a esas refs.
+- **Tocs desde un screenshot:** leer el PNG con read; si la imagen viene
+  redimensionada, `amctl tapshot X Y W H` con el tamaño con el que la viste.
 
 ## Seguridad
 

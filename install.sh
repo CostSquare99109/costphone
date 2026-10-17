@@ -18,8 +18,9 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HOME/bin"
 SKILL_DIR="$HOME/.config/opencode/skills/android/phone-control"
 AGENTS="$HOME/.config/opencode/AGENTS.md"
-APK_SRC="$REPO_DIR/apk/CostPhone-v1.0.apk"
-APK_DEST="/sdcard/Download/CostPhone-v1.0.apk"
+APK_SRC="$(ls -1 "$REPO_DIR"/apk/CostPhone-v*.apk 2>/dev/null | sort -V | tail -1 || true)"
+[[ -z "$APK_SRC" ]] && APK_SRC="$REPO_DIR/app/build/CostPhone.apk"
+APK_DEST="/sdcard/Download/$(basename "$APK_SRC")"
 
 G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'
 step() { echo -e "${G}[+]${N} $*"; }

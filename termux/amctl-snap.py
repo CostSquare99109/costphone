@@ -24,12 +24,22 @@ FLAG_RE = re.compile(r' (clk|scr|edt|chk|foc)=1$')
 
 def parse(path):
     pkg = ""
+    win = ""          # "" = ventana principal; "ime"/"ovl"/"sys"/"app+" etc
     nodes = []
     with open(path, encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             line = raw.rstrip("\n")
             if line.startswith("# pkg="):
                 pkg = line[len("# pkg="):].strip()
+                win = ""
+                continue
+            if line.startswith("# win="):
+                # línea "# win=ime pkg=com.xxx" desde el servicio (ventanas extra)
+                m = re.match(r"# win=(\S+)(?: pkg=(.*))?", line)
+                if m:
+                    win = m.group(1)
+                    if not pkg and m.group(2):
+                        pkg = m.group(2)
                 continue
             m = NODE_RE.match(line)
             if not m:
@@ -47,7 +57,7 @@ def parse(path):
                 "depth": len(indent) // 2, "cls": cls, "id": vid,
                 "l": l, "t": t, "r": r, "b": b,
                 "cx": (l + r) // 2, "cy": (t + b) // 2,
-                "txt": txt, "desc": desc, "flags": flags,
+                "txt": txt, "desc": desc, "flags": flags, "win": win,
             })
     return pkg, nodes
 
@@ -71,10 +81,12 @@ def main():
     args = sys.argv[1:]
     all_mode = any(a in ("-a", "--all") for a in args)
     filt = None
+    skip = set()
     if "--filter" in args:
         k = args.index("--filter")
         filt = args[k + 1].lower() if k + 1 < len(args) else None
-    path = next((a for a in args if not a.startswith("-") and a != filt), TREE)
+        skip = {k, k + 1}
+    path = next((a for i, a in enumerate(args) if i not in skip and not a.startswith("-")), TREE)
     if not os.path.isfile(path):
         print(f"(no existe {path} — ejecuta: amctl tree)")
         return 1
@@ -115,15 +127,21 @@ def main():
                 bits.append("[check]")
             if "scr" in nd["flags"] and "clk" not in nd["flags"]:
                 bits.append("[scroll]")
+            if nd["win"]:
+                wtag = nd["win"]
+                bits.append("[" + ("ovl" if wtag == "overlay" else "sys" if wtag == "system" else wtag) + "]")
             lines.append(" ".join(bits))
             mf.write(f"{ref}\t{nd['cx']}\t{nd['cy']}\t{nd['l']}\t{nd['t']}"
-                     f"\t{nd['r']}\t{nd['b']}\t{nd['id']}\t{label}\n")
+                     f"\t{nd['r']}\t{nd['b']}\t{nd['id']}\t{label}\t{nd['win']}\n")
 
     mode = "todos" if all_mode else "interactivos"
     print(f"Pantalla: {pkg or '?'} — {len(picks)} elementos ({mode}) de {len(nodes)} nodos")
     for line in lines:
         print(line)
-    print("refs: amctl tapref @pN  |  re-snap tras cada cambio de pantalla")
+    if all_mode and len(picks) > 120:
+        print(f"tip: -a mostró {len(picks)} — usa 'amctl snap -a --filter TEXTO' para reducir")
+    print(f"refs: amctl tapref @pN  |  re-snap tras cada cambio de pantalla"
+          + ("  |  [ime]/[ovl]/[sys]=ventanas extra (teclado, toolbars)" if any(nd["win"] for nd, _ in picks) else ""))
     return 0
 
 

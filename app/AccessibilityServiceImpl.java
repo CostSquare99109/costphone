@@ -21,6 +21,7 @@ import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -290,20 +291,12 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 break;
             }
             case ACTION_GET_UI_TREE: {
-                AccessibilityNodeInfo root = getRootInActiveWindow();
-                if (root != null) {
-                    List<String> lines = new ArrayList<>();
-                    dumpNode(root, lines, 0, 25);
-                    if (lines.size() > 3000) lines = lines.subList(0, 3000);
-                    StringBuilder sb = new StringBuilder();
-                    sb.append("# pkg=").append(root.getPackageName()).append('\n');
-                    for (String line : lines) {
-                        Log.d(TAG, line);
-                        sb.append(line).append('\n');
-                    }
-                    try { saveToDownloads("accessdroid-tree.txt", "text/plain", sb.toString().getBytes("UTF-8")); }
-                    catch (Exception e) { Log.w(TAG, "tree encode fail", e); }
-                }
+                List<String> lines = new ArrayList<>();
+                dumpAllWindows(lines);
+                if (lines.isEmpty()) break;
+                if (lines.size() > 3500) lines = lines.subList(0, 3500);
+                try { saveToDownloads("accessdroid-tree.txt", "text/plain", joinLines(lines).getBytes("UTF-8")); }
+                catch (Exception e) { Log.w(TAG, "tree encode fail", e); }
                 break;
             }
             case ACTION_SCREENDUMP: {
@@ -573,6 +566,62 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     /* -------------------------------------------------------------- */
     /*                      UI-tree / find helpers                    */
     /* -------------------------------------------------------------- */
+
+    /** Dump main window + IME/overlay windows: keyboard and floating toolbars
+     *  become part of the tree (amctl-snap tags them [ime]/[ovl]/[sys]). */
+    private void dumpAllWindows(List<String> out) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return;
+        out.add("# pkg=" + root.getPackageName());
+        dumpNode(root, out, 0, 25);
+        Log.d(TAG, "root window: " + root.getPackageName());
+
+        List<AccessibilityWindowInfo> wins = null;
+        try { wins = getWindows(); } catch (Exception e) { Log.w(TAG, "getWindows fail", e); }
+        if (wins == null) return;
+
+        Rect mainRect = new Rect();
+        root.getBoundsInScreen(mainRect);
+        String mainPkg = String.valueOf(root.getPackageName());
+        for (int i = 0; i < wins.size(); i++) {
+            AccessibilityWindowInfo aw = wins.get(i);
+            if (aw == null) continue;
+            AccessibilityNodeInfo wroot = null;
+            try { wroot = aw.getRoot(); } catch (Exception e) { continue; }
+            if (wroot == null) continue;
+            // skip: root window itself (same pkg + same screen bounds)
+            Rect wr = new Rect();
+            wroot.getBoundsInScreen(wr);
+            String wpkg = String.valueOf(wroot.getPackageName());
+            if (wr.equals(mainRect) && wpkg.equals(mainPkg)) continue;
+            String kind = windowTag(aw.getType());
+            if (kind == null) continue;   // TYPE_APPLICATION duplicada: omitir
+            out.add("# win=" + kind + " pkg=" + wpkg);
+            int before = out.size();
+            dumpNode(wroot, out, 0, 25);
+            Log.d(TAG, "extra window " + kind + " nodes=" + (out.size() - before));
+        }
+    }
+
+    private String windowTag(int type) {
+        switch (type) {
+            case AccessibilityWindowInfo.TYPE_INPUT_METHOD:        return "ime"; // teclado
+            case AccessibilityWindowInfo.TYPE_SYSTEM:              return "sys"; // system overlays
+            case AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY: return "ovl"; // toolbars flotantes
+            case AccessibilityWindowInfo.TYPE_SPLIT_SCREEN_DIVIDER: return "div";
+            case AccessibilityWindowInfo.TYPE_MAGNIFICATION_OVERLAY: return "mag";
+            default: return null;                                   // TYPE_APPLICATION: duplica la raíz
+        }
+    }
+
+    private String joinLines(List<String> lines) {
+        StringBuilder sb = new StringBuilder();
+        for (String line : lines) {
+            sb.append(line).append('\n');
+        }
+        return sb.toString();
+    }
+
     private AccessibilityNodeInfo findByText(AccessibilityNodeInfo node, String text) {
         if (node == null) return null;
         CharSequence cs = node.getText();

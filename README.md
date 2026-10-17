@@ -80,9 +80,14 @@ amctl see      # captura PNG -> /sdcard/Download/accessdroid-shot.png
 | Árbol de UI completo | `amctl tree` |
 | Snapshot incluyendo no-interactivos | `amctl snap -a` |
 | Filtrar por texto | `amctl snap --filter "Enviar"` |
+| Navegar a una URL (sin omnibox) | `amctl openurl https://…` |
 | Captura PNG | `amctl see` |
 | Lanzar app | `amctl launch com.whatsapp` |
-| Escribir en el campo enfocado | `amctl type "hola mundo"` |
+| Escribir en el campo enfocado (reemplaza) | `amctl type "hola mundo"` |
+| Vaciar el campo enfocado | `amctl cleartext` |
+| Pegar clipboard en el campo | `amctl paste` |
+| Enfocar un campo por texto | `amctl focus "Buscar…"` |
+| Tocar desde coords del screenshot | `amctl tapshot X Y [W H]` |
 | Tocar por coordenadas | `amctl tap 540 960` |
 | Long-press | `amctl longpress 540 960 700` |
 | Swipe | `amctl swipe 540 1800 540 600` |
@@ -90,6 +95,10 @@ amctl see      # captura PNG -> /sdcard/Download/accessdroid-shot.png
 | Atrás / Inicio / Recientes | `amctl back` / `home` / `recents` |
 | Clic por texto | `amctl click "Enviar"` |
 | Clic por resource-id | `amctl clickid com.whatsapp:id/send` |
+
+Extra v1.1: cuando el teclado o una toolbar flotante están abiertos, sus
+botones entran al snapshot marcados `[ime]` / `[ovl]` / `[sys]` — Enter,
+borrar y "Seleccionar todo" se tocan con `tapref` como cualquier elemento.
 
 ### El loop (estilo agent-browser)
 
