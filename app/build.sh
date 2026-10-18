@@ -4,12 +4,47 @@ set -euo pipefail
 
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$PROJ/build"
-ANDROID_JAR=$(ls ~/android-sdk/platforms/android-*/android.jar 2>/dev/null | tail -1)
-[[ -z "$ANDROID_JAR" ]] && { echo "✗ android.jar not found in ~/android-sdk/platforms/"; exit 1; }
-SDK_BT=$(ls -d ~/android-sdk/build-tools/36.0.0 2>/dev/null || ls -d ~/android-sdk/build-tools/3[4-9]* 2>/dev/null | tail -1)
-[[ -z "$SDK_BT" ]] && { echo "✗ build-tools not found"; exit 1; }
-D8="bash $SDK_BT/d8"
-APKSIGNER="java -jar $SDK_BT/lib/apksigner.jar"
+SDK_ROOT=""
+ANDROID_JAR=""
+SDK_BT=""
+# SDK: prioriza ANDROID_HOME, luego ANDROID_SDK_ROOT, y solo al final el
+# layout local de Termux (~/android-sdk). Sin esto, en CI el script busca en
+# ~/android-sdk, que no existe, y falla con "android.jar not found".
+if [[ -n "${ANDROID_HOME:-}" && -d "$ANDROID_HOME" ]]; then
+    SDK_ROOT="$ANDROID_HOME"
+elif [[ -n "${ANDROID_SDK_ROOT:-}" && -d "$ANDROID_SDK_ROOT" ]]; then
+    SDK_ROOT="$ANDROID_SDK_ROOT"
+elif [[ -d "$HOME/android-sdk" ]]; then
+    SDK_ROOT="$HOME/android-sdk"
+else
+    echo "✗ Android SDK no encontrado (ANDROID_HOME/ANDROID_SDK_ROOT/$HOME/android-sdk)"
+    exit 1
+fi
+
+ANDROID_JAR="$SDK_ROOT/platforms/android-34/android.jar"
+if [[ ! -f "$ANDROID_JAR" ]]; then
+    # fallback: cualquier plataforma instalada, la más alta.
+    ANDROID_JAR=$(ls "$SDK_ROOT"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)
+fi
+[[ -z "$ANDROID_JAR" || ! -f "$ANDROID_JAR" ]] && { echo "✗ android.jar not found in $SDK_ROOT/platforms/"; exit 1; }
+
+# Build-tools: si BUILD_TOOLS_VERSION está definida, exige que exista; si no,
+# detecta la mayor versión instalada.
+if [[ -n "${BUILD_TOOLS_VERSION:-}" ]]; then
+    if [[ ! -d "$SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION" ]]; then
+        echo "✗ Build Tools $BUILD_TOOLS_VERSION no encontrada en $SDK_ROOT/build-tools/"
+        exit 1
+    fi
+    SDK_BT="$SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION"
+else
+    SDK_BT=$(ls -d "$SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -1)
+fi
+[[ -z "$SDK_BT" || ! -d "$SDK_BT" ]] && { echo "✗ build-tools not found in $SDK_ROOT/build-tools/"; exit 1; }
+
+# Llamadas seguras: no guardamos "bash ..." ni "java -jar ..." en una sola
+# variable, para que las rutas con espacios se traten como argumentos aparte.
+run_d8() { bash "$SDK_BT/d8" "$@"; }
+run_apksigner() { java -jar "$SDK_BT/lib/apksigner.jar" "$@"; }
 # Keystore: variables de entorno (CI) tienen prioridad. Si no existen, se usa
 # el keystore de debug local y se crea si no está (compatibilidad con el
 # flujo anterior en Termux).
@@ -103,7 +138,7 @@ find "$OUT/classes" -name '*.class' | wc -l | xargs echo "     classes:"
 # 5. Convert → classes.dex
 echo "[5/7] Create DEX (d8)..."
 mkdir -p "$OUT/dex"
-$D8 --output "$OUT/dex" \
+run_d8 --output "$OUT/dex" \
     --lib "$ANDROID_JAR" \
     --min-api 24 \
     $(find "$OUT/classes" -name '*.class') ${LIBJARS[@]+"${LIBJARS[@]}"} 2>&1 | tail -5
@@ -130,7 +165,7 @@ if [[ ! -f "$KEYSTORE" ]]; then
         -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" \
         -dname "CN=Android Debug,O=Android,C=US" 2>&1 | tail -3
 fi
-$APKSIGNER sign \
+run_apksigner sign \
     --ks "$KEYSTORE" \
     --ks-pass "pass:$KEYSTORE_PASSWORD" \
     --key-pass "pass:$KEY_PASSWORD" \
@@ -142,7 +177,7 @@ echo "     ✓ signed"
 # Verify
 echo ""
 echo "────────────────────────────────────────────"
-$APKSIGNER verify -v "$OUT/CostPhone.apk" 2>&1 | head -10
+run_apksigner verify -v "$OUT/CostPhone.apk" 2>&1 | head -10
 echo "────────────────────────────────────────────"
 aapt2 dump badging "$OUT/CostPhone.apk" 2>&1 | grep -E 'package:|application-label:|sdkVersion:|uses-permission:|launchable-activity:' | head -12
 echo "────────────────────────────────────────────"
