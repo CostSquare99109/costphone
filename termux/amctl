@@ -69,12 +69,23 @@
 #   float    <texto> [pkg]      Pon la app en ventana flotante (recents->long-press->MIUI)
 #   screenshot [file]          Screenshot PNG -> /sdcard/Download/accessdroid-shot.png
 #   presskey <key>               Press a key (back/home/recents only)
+#
+# Pantalla virtual (display secundario para el agente):
+#   display                    Lista los displays (id, tamaño, dpi)
+#   display on [w h dpi flags] Crea la pantalla virtual (def: 1080 1920 320).
+#                              flags: gravity_top_left|top_right|bottom_left|bottom_right
+#   display off                La apaga
+#   -d N / --display N         Dirige ESTA orden al display N (ej: amctl -d 2 snap).
+#                              Afecta a tap/swipe/type/click/snap/tree/see/launch/back.
+#                              Sin -d, todo va a la pantalla 0 (la del usuario).
 #==============================================================================
 
 set -u
 PROG="amctl"
 SECRET="termux-accessdroid-2025"
 PKG="com.accessdroid.termux"
+DISPLAY_ID=0
+POSITIONAL=()
 
 # ---- transport auto-detection: AM socket if available, else classic 'am' ----
 TRANSPORT="am"
@@ -433,7 +444,10 @@ scale_guard() {
 #   (the classic 'am' cannot run dumpsys, so the tree is the fallback)
 fg_pkg() {
     local out
-    if session_alive; then
+    # con -d N 'dumpsys window' habla del display 0, así que no sirve: el árbol de
+    # ese display es la única fuente (y si no tiene ventanas propias, no hay
+    # '# pkg=' -> desconocido -> el modo seguro lo niega)
+    if session_alive && [[ "$DISPLAY_ID" == "0" ]]; then
         session_raw "dumpsys window 2>/dev/null | grep -m1 -E 'mCurrentFocus|mFocusedApp' | grep -m1 -oE '[a-zA-Z0-9_]+[.][a-zA-Z0-9_.]+/[a-zA-Z0-9_.]+'" || :
         out="$SESSION_OUT"
         if [[ "$out" =~ ^([A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+)/ ]]; then
@@ -563,7 +577,7 @@ out_path_ok() {
 action_exempt() {
     local a="$1"; shift
     case "$a" in
-        *GET_UI_TREE|*SCREENDUMP|*ACTION_BACK|*ACTION_HOME|*ACTION_RECENTS) return 0 ;;
+        *.ACTION_GET_UI_TREE|*.ACTION_SCREENDUMP|*.ACTION_BACK|*.ACTION_HOME|*.ACTION_RECENTS) return 0 ;;
         *ACTION_PRESS_KEY)
             local prev='' x
             for x in "$@"; do
@@ -581,9 +595,11 @@ action_exempt() {
 bc_raw() {
     # $1 = action, rest are --es/--ei/--el extras
     local action="$1"; shift
+    local -a disp=()
+    [[ "$DISPLAY_ID" != "0" ]] && disp=( --ei display "$DISPLAY_ID" )
     if session_alive; then
         local rc=0
-        session_run am broadcast -p "$PKG" -a "$action" --es secret "$SECRET" "$@" || rc=$?
+        session_run am broadcast -p "$PKG" -a "$action" --es secret "$SECRET" "${disp[@]}" "$@" || rc=$?
         [[ $rc == 0 ]] && return 0
         case "$rc" in
             2) session_drop "rish: Server is not running / Request timeout / rish muerto" ;;
@@ -592,12 +608,13 @@ bc_raw() {
     elif session_dirty; then
         session_drop "rish no está corriendo"
     fi
-    tam broadcast -p "$PKG" -a "$action" --es secret "$SECRET" "$@" >/dev/null 2>&1
+    tam broadcast -p "$PKG" -a "$action" --es secret "$SECRET" "${disp[@]}" "$@" >/dev/null 2>&1
 }
 
 # ---- guarded broadcast: every action that can act on the foreground app ----
+# (el broadcast lleva siempre el secreto y, con -d N, el display destino)
 bc() {
-    # $1 = action, rest are --es/--ei/--el extras
+    # $1 = action, resto = extras --es/--ei/--el
     local action="$1"; shift
     # logged only when it really goes out; a refusal is logged as DENY alone
     if ! action_exempt "$action" "$@"; then
@@ -671,6 +688,28 @@ resolve_pkg() {
         echo "'$input' matches:"; echo "$matches" >&2; return 1
     fi
     echo "$matches"; return 0
+}
+
+# ---- flags globales: -d N / --display N  (resto en POSITIONAL) ----
+parse_display() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--display)
+                if [[ -n "${2:-}" ]]; then DISPLAY_ID="$2"; shift 2; continue; fi ;;
+            -d?*) DISPLAY_ID="${1#-d}"; shift; continue ;;
+        esac
+        POSITIONAL+=("$1"); shift
+    done
+}
+
+map_file() {
+    if [[ "$DISPLAY_ID" == "0" ]]; then echo "$HOME/.cache/amctl/snapshot-map.tsv"
+    else echo "$HOME/.cache/amctl/snapshot-map-d$DISPLAY_ID.tsv"; fi
+}
+
+shot_file() {
+    if [[ "$DISPLAY_ID" == "0" ]]; then echo "/sdcard/Download/accessdroid-shot.png"
+    else echo "/sdcard/Download/accessdroid-shot-d$DISPLAY_ID.png"; fi
 }
 
 # ========================= subcommands =========================
@@ -781,6 +820,14 @@ cmd_find() {
 }
 
 cmd_launch() {
+    if [[ "$DISPLAY_ID" != "0" ]]; then
+        # lanzar en la pantalla virtual lo hace la propia app (ActivityOptions.setLaunchDisplayId);
+        # 'am start' no sabe dirigir un display, así que esta rama va primero
+        local pkg; pkg=$(resolve_pkg "$1") || return $?
+        bc com.accessdroid.termux.ACTION_START_ACTIVITY --es package "$pkg"
+        echo "Launched $pkg on display $DISPLAY_ID"
+        return 0
+    fi
     # with a live session: plain 'am start' through the pipe (~0.8s, no socket)
     if session_alive; then
         local sp="${1:-}"
@@ -833,13 +880,13 @@ cmd_grant()  { need_socket grant || return $?; local pkg; pkg=$(resolve_pkg "$1"
 cmd_revoke() { need_socket revoke || return $?; local p; p=$(resolve_pkg "$1") || return $?; shift; local perm; tam pm revoke "${p}" "${1:-}" 2>/dev/null; }
 cmd_clear()  { need_socket clear || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam clear package "$pkg" 2>/dev/null && echo "Cleared $pkg"; }
 cmd_tree()   { local f=/sdcard/Download/accessdroid-tree.txt; guard_readonly tree || return $?; rm -f "$f"; bc_raw com.accessdroid.termux.ACTION_GET_UI_TREE; wait_file "$f" 5 && { cat "$f"; return 0; }; echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)"; return 1; }
-cmd_snap()   { local f=/sdcard/Download/accessdroid-tree.txt; guard_readonly snap || return $?; rm -f "$f"; bc_raw com.accessdroid.termux.ACTION_GET_UI_TREE; wait_file "$f" 5 || { echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2; return 1; }; python3 "$HOME/bin/amctl-snap.py" "$@"; }
+cmd_snap()   { local f=/sdcard/Download/accessdroid-tree.txt; guard_readonly snap || return $?; rm -f "$f"; bc_raw com.accessdroid.termux.ACTION_GET_UI_TREE; wait_file "$f" 5 || { echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2; return 1; }; python3 "$HOME/bin/amctl-snap.py" --display "$DISPLAY_ID" "$@"; }
 
 cmd_tapref() {
     local ref="${1:-}"
     [[ -z "$ref" ]] && { echo "uso: amctl tapref @pN  (refs de 'amctl snap')" >&2; return 2; }
     ref="${ref#@}"; [[ "$ref" != p* ]] && ref="p$ref"
-    local MAP="$HOME/.cache/amctl/snapshot-map.tsv"
+    local MAP; MAP=$(map_file)
     [[ -f "$MAP" ]] || { echo "no hay snapshot — ejecuta: amctl snap" >&2; return 1; }
     local line; line=$(awk -F'\t' -v r="$ref" '$1==r{print; exit}' "$MAP")
     [[ -z "$line" ]] && { echo "ref @$ref no existe — re-ejecuta: amctl snap" >&2; return 1; }
@@ -855,7 +902,17 @@ cmd_longpress()  { ac com.accessdroid.termux.ACTION_LONG_PRESS --ei x "${1:-0}" 
 cmd_swipe()      { ac com.accessdroid.termux.ACTION_SWIPE --ei x1 "${1:-0}" --ei y1 "${2:-0}" --ei x2 "${3:-0}" --ei y2 "${4:-0}" --el duration "${5:-300}"; }
 cmd_scroll()     { local dir="${1:-down}"; [[ "$dir" == down ]] && ac com.accessdroid.termux.ACTION_SCROLL_DOWN --ei x "${2:-0}" --ei y "${3:-0}" \
                     || ac com.accessdroid.termux.ACTION_SCROLL_UP --ei x "${2:-0}" --ei y "${3:-0}"; }
-cmd_back()       { bc com.accessdroid.termux.ACTION_BACK; }
+cmd_back()       { if [[ "$DISPLAY_ID" != "0" ]]; then
+                        # back dirigido: busca el botón de retroceso de la app en ese display.
+                        # Si no lo encuentra, la app escribe el motivo aquí.
+                        local errf=/sdcard/Download/accessdroid-error.txt rc=0
+                        rm -f "$errf"
+                        bc com.accessdroid.termux.ACTION_DISPLAY_BACK || rc=$?
+                        [[ $rc == 0 ]] || return $rc      # no tragarse un rc=6 de la guardia
+                        sleep 2
+                        if [[ -f "$errf" ]]; then echo "back (display $DISPLAY_ID): $(cat "$errf")"; return 1; fi
+                        return 0
+                    else bc com.accessdroid.termux.ACTION_BACK; fi; }
 cmd_home()       { bc com.accessdroid.termux.ACTION_HOME; }
 cmd_recents()    { bc com.accessdroid.termux.ACTION_RECENTS; }
 cmd_type()       { bc com.accessdroid.termux.ACTION_TYPE --es text "$1"; }
@@ -865,6 +922,21 @@ cmd_focus()      { local t="${1:-}"; if [[ -n "$t" ]]; then bc com.accessdroid.t
 cmd_openurl() {
     local url="${1:-}" app="${2:-}"
     [[ -z "$url" ]] && { echo "uso: amctl openurl <url> [pkg-navegador]   (ej: openurl https://x.com com.android.chrome)" >&2; return 2; }
+    if [[ "$DISPLAY_ID" != "0" ]]; then
+        # Con -d N NO vale `tam start`: abriría en la pantalla 0 siempre.
+        # Va por el servicio, que sí sabe dirigir el launch a un display.
+        local errf=/sdcard/Download/accessdroid-error.txt
+        rm -f "$errf"
+        if [[ -n "$app" ]]; then
+            cmd_launch "$app" || return 1   # el paquete manda: abre en dN
+        else
+            bc com.accessdroid.termux.ACTION_OPEN_URI --es uri "$url" --ei display "$DISPLAY_ID" || return 1
+            sleep 1
+            [[ -f "$errf" ]] && echo "⚠ $(cat "$errf")"
+        fi
+        echo "openurl: $url (display $DISPLAY_ID)"
+        return 0
+    fi
     if tam start --user 0 -a android.intent.action.VIEW -d "$url" ${app:+-p "$app"} >/dev/null 2>&1; then
         echo "openurl: $url${app:+ -> $app}"
     elif [[ -z "$app" ]] && bc com.accessdroid.termux.ACTION_OPEN_URI --es uri "$url"; then
@@ -875,8 +947,9 @@ cmd_openurl() {
     fi
 }
 cmd_tapshot() {
-    local png=/sdcard/Download/accessdroid-shot.png
-    [[ ! -f "$png" ]] && { echo "no hay screenshot: ejecuta primero amctl see" >&2; return 1; }
+    local png; png=$(shot_file)
+    [[ ! -f "$png" && "$DISPLAY_ID" == "0" ]] && png=/sdcard/Download/accessdroid-shot.png
+    [[ ! -f "$png" ]] && { echo "no hay screenshot: ejecuta primero amctl ${DISPLAY_ID:+-d $DISPLAY_ID }see" >&2; return 1; }
     local dim
     dim=$(python3 - "$png" <<'PY'
 import struct, sys
@@ -905,8 +978,98 @@ PY
 cmd_click()      { bc com.accessdroid.termux.ACTION_CLICK_TEXT --es text "$1"; }
 cmd_clickid()    { bc com.accessdroid.termux.ACTION_CLICK_ID --es id "$1"; }
 cmd_scrollto()   { bc com.accessdroid.termux.ACTION_SCROLL_TO --es text "$1"; }
-cmd_shot()       { guard_readonly shot || return $?; local f="${1:-/sdcard/Download/accessdroid-shot.png}"; local i; rm -f "$f" 2>/dev/null; for i in 1 2 3; do bc com.accessdroid.termux.ACTION_SCREENDUMP; wait_file "$f" 2 && break; done; if [[ -f "$f" ]]; then echo "PNG: $f ($(stat -c%s "$f") bytes)"; else echo "(no se guardo el PNG)"; if [[ -f /sdcard/Download/accessdroid-shot-error.txt ]]; then echo "error del servicio:"; cat /sdcard/Download/accessdroid-shot-error.txt; fi; fi; }
+cmd_shot()       { guard_readonly shot || return $?; local f="${1:-$(shot_file)}"; local i; rm -f "$f" 2>/dev/null; for i in 1 2 3; do bc_raw com.accessdroid.termux.ACTION_SCREENDUMP --ei displayId "$DISPLAY_ID"; wait_file "$f" 2 && break; done; if [[ -f "$f" ]]; then echo "PNG: $f ($(stat -c%s "$f") bytes)"; else echo "(no se guardo el PNG)"; if [[ -f /sdcard/Download/accessdroid-shot-error.txt ]]; then echo "error del servicio:"; cat /sdcard/Download/accessdroid-shot-error.txt; fi; fi; }
 cmd_presskey()   { local k="$1"; local code=0; case "$k" in back) code=4;; home) code=3;; recents) code=187;; *) echo "only back|home|recents supported" >&2; return 1;; esac; bc com.accessdroid.termux.ACTION_PRESS_KEY --ei keyCode "$code"; }
+
+# display [on [w h dpi [nombre]] | off | status] — pantalla virtual del agente
+# Flags que entiende AOSP + el pseudo-flag 'mirror' (ver normalize_display_flags).
+OVERLAY_FLAGS_RE='^(secure|own_content_only|should_show_system_decorations|gravity_top_left|gravity_top_right|gravity_bottom_left|gravity_bottom_right|mirror)$'
+
+# Normaliza y valida los flags de `display on`. Falla aquí (rápido, sin
+# broadcast) en vez de dejar que AOSP rechace el ajuste entero en silencio.
+# Acepta 'gravity_bottom_right', 'gravity_bottom_right,secure' o ambos sueltos.
+normalize_display_flags() {
+    local out="" tok seen
+    for tok in ${*//,/ }; do
+        tok="${tok,,}"
+        [[ -z "$tok" ]] && continue
+        if [[ ! "$tok" =~ $OVERLAY_FLAGS_RE ]]; then
+            echo "✗ flag no soportado: '$tok'" >&2
+            echo "  válidos: secure, own_content_only, should_show_system_decorations," >&2
+            echo "           gravity_top_left|top_right|bottom_left|bottom_right, mirror" >&2
+            return 2
+        fi
+        case ",$out," in *",$tok,"*) continue ;; esac     # sin duplicados
+        out="${out:+$out,}$tok"
+    done
+    printf '%s' "$out"
+}
+
+# Espera a que el servicio escriba su informe de displays. 0 = apareció.
+wait_report() {
+    local f=$1 i
+    for i in 1 2 3 4 5 6; do sleep 1; [[ -f "$f" ]] && return 0; done
+    return 1
+}
+
+# Imprime la línea de error/aviso de la operación anterior (on/off), si la hay.
+# Sin esto el aviso se perdería: el refresco de estado pisa el informe.
+report_problem() {
+    local f=$1 line
+    [[ -f "$f" ]] || return 0
+    while IFS= read -r line; do
+        case "$line" in error=*) echo "✗ ${line#error=}" ;; esac
+    done < "$f"
+}
+
+cmd_display() {
+    local op="${1:-status}"
+    local f=/sdcard/Download/accessdroid-displays.txt
+    local i
+    case "$op" in
+        on)
+            # $2=ancho $3=alto $4=dpi $5..=flags (uno o varios, con o sin comas)
+            local flags
+            flags="$(normalize_display_flags "${@:5}")" || return 2
+            rm -f "$f"    # limpio antes, para no leer un informe viejo
+            bc com.accessdroid.termux.ACTION_DISPLAY --es op on \
+               --ei width "${2:-1080}" --ei height "${3:-1920}" --ei density "${4:-320}" \
+               --es flags "$flags" || return $?
+            sleep 2      # el display se crea asíncrono (~1s)
+            wait_report "$f" || true
+            report_problem "$f"
+            ;;
+        off)
+            rm -f "$f"
+            bc com.accessdroid.termux.ACTION_DISPLAY --es op off || return $?
+            sleep 1
+            wait_report "$f" || true
+            report_problem "$f"
+            ;;
+        status) ;;
+        *) echo "uso: amctl display [on [ancho alto dpi [flags...]] | off | status]" >&2; return 2 ;;
+    esac
+    rm -f "$f"
+    bc com.accessdroid.termux.ACTION_DISPLAY --es op status || return $?
+    wait_report "$f" || { echo "(⚠ el servicio no respondió — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2; return 1; }
+    local line first=1
+    while IFS= read -r line; do
+        case "$line" in
+            error=*) echo "✗ ${line#error=}" ;;
+            display=*) first=0
+                local id nm sz dp st wn
+                id=${line#display=};      id=${id%% *}
+                nm=${line#*name=};        nm=${nm%% *}
+                sz=${line#*size=};        sz=${sz%% *}
+                dp=${line#*dpi=};         dp=${dp%% *}
+                st=${line#*state=};       st=${st%% *}
+                wn=${line#*wins=}
+                printf "  d%-3s %-14s %-10s %-5s %-4s ventanas:%s\n" "$id" "$nm" "$sz" "$dp" "$st" "$wn" ;;
+            overlay=*) [[ $first == 1 ]] || echo "  ajuste overlay_display_devices: ${line#overlay=}" ;;
+        esac
+    done < "$f"
+    return 0
+}
 
 # float <texto>: recents -> tarjeta de la app (por texto) -> long-press -> 'ventanas flotantes'
 # (flujo MIUI/HyperOS verificado: recents, longpress en tarjeta, menu_item_small_window)
@@ -944,6 +1107,11 @@ cmd_float() {
 
 cmd_input() {
     local sub="${1:-}"
+    if [[ "$DISPLAY_ID" != "0" ]]; then
+        echo "amctl input: 'input' (rish) no puede dirigir un display." >&2
+        echo "  Para la pantalla virtual usa: amctl -d $DISPLAY_ID tapref/tap/swipe/click/type" >&2
+        return 2
+    fi
     case "$sub" in
         tap|swipe|text|keyevent) ;;
         "") echo "uso: amctl input tap X Y | swipe X1 Y1 X2 Y2 [ms] | text TEXTO | keyevent CODIGO" >&2; return 2 ;;
@@ -1010,6 +1178,11 @@ cmd_input() {
 
 cmd_screencap() {
     local out="${1:-/sdcard/Download/amctl-shizuku.png}"
+    if [[ "$DISPLAY_ID" != "0" ]]; then
+        echo "amctl screencap: 'screencap' (rish) sólo captura el display 0." >&2
+        echo "  Para la pantalla virtual usa: amctl -d $DISPLAY_ID see" >&2
+        return 2
+    fi
     need_session screencap || return $?
     out_path_ok "$out" || return 2
     guard_readonly screencap || return $?
@@ -1191,6 +1364,9 @@ cmd_screenrecord() {
 }
 
 # ========================= dispatcher =========================
+parse_display "$@"
+set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+
 case "${1:-help}" in
     input)      shift; cmd_input "$@" ;;
     screencap)  cmd_screencap "${2:-}" ;;
@@ -1239,6 +1415,8 @@ case "${1:-help}" in
     shot)      cmd_shot "${2:-}" ;;
     see)       cmd_shot "${2:-}" ;;
     presskey)  cmd_presskey "${2:-}" ;;
+    display)   shift; cmd_display "$@" ;;
+    displays)  cmd_display status ;;
     help|-h|--help)
         awk '/^#====/{c++; if(c==2) exit} c>=1{print}' "$0" | sed 's/^# \{0,1\}//' ;;
     *) echo "unknown command: $1 (use 'amctl help')" >&2; exit 1 ;;

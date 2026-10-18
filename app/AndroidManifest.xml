@@ -1,12 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.accessdroid.termux"
-    android:versionCode="10"
-    android:versionName="1.1">
+    android:versionCode="11"
+    android:versionName="1.2">
 
     <!-- CostPhone: solo servicio de accesibilidad + lanzar apps -->
     <uses-permission android:name="android.permission.BIND_ACCESSIBILITY_SERVICE"/>
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+    <!-- Pantalla virtual (overlay_display_devices). Se concede UNA vez con:
+         adb shell pm grant com.accessdroid.termux android.permission.WRITE_SECURE_SETTINGS
+         Sin este permiso la app sigue funcionando igual, solo no puede crear
+         la pantalla secundaria. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"/>
 
     <supports-screens
         android:smallScreens="true"

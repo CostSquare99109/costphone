@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """amctl-snap — convierte accessdroid-tree.txt en un snapshot compacto con refs @pN.
 
-Uso: amctl-snap.py [-a|--all] [--filter TEXTO] [ruta-tree]
+Uso: amctl-snap.py [-a|--all] [--filter TEXTO] [--display N] [ruta-tree]
 
 Salida:
   stdout: lista de elementos interactivos (estilo agent-browser snapshot -i)
-  ~/.cache/amctl/snapshot-map.tsv: ref -> coords + id (para 'amctl tapref')
+  ~/.cache/amctl/snapshot-map[-dN].tsv: ref -> coords + id (para 'amctl tapref')
 """
 import os
 import re
@@ -13,7 +13,6 @@ import sys
 
 TREE = "/sdcard/Download/accessdroid-tree.txt"
 CACHE = os.path.expanduser("~/.cache/amctl")
-MAP = os.path.join(CACHE, "snapshot-map.tsv")
 
 NODE_RE = re.compile(
     r'^(\s*)\[([^\]]+)\] id=(\S*) '
@@ -26,9 +25,15 @@ def parse(path):
     pkg = ""
     win = ""          # "" = ventana principal; "ime"/"ovl"/"sys"/"app+" etc
     nodes = []
+    empty_of = ""     # id del display que el servicio declara vacío
     with open(path, encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             line = raw.rstrip("\n")
+            if line.startswith("# d") and "vacío" in line:
+                # el servicio dice que ese display no tiene ventanas propias:
+                # no es que el servicio esté caído, es que no hay nada que leer
+                empty_of = line[2:].split(":")[0].strip()
+                break
             if line.startswith("# pkg="):
                 pkg = line[len("# pkg="):].strip()
                 win = ""
@@ -59,7 +64,7 @@ def parse(path):
                 "cx": (l + r) // 2, "cy": (t + b) // 2,
                 "txt": txt, "desc": desc, "flags": flags, "win": win,
             })
-    return pkg, nodes
+    return pkg, nodes, empty_of
 
 
 def child_text(nodes, i, limit=4, width=70):
@@ -81,17 +86,27 @@ def main():
     args = sys.argv[1:]
     all_mode = any(a in ("-a", "--all") for a in args)
     filt = None
+    display = 0
     skip = set()
     if "--filter" in args:
         k = args.index("--filter")
         filt = args[k + 1].lower() if k + 1 < len(args) else None
-        skip = {k, k + 1}
+        skip.add(k)
+        skip.add(k + 1)
+    if "--display" in args:
+        k = args.index("--display")
+        if k + 1 < len(args) and args[k + 1].isdigit():
+            display = int(args[k + 1])
+        skip.add(k)
+        skip.add(k + 1)
+    mapfile = os.path.join(
+        CACHE, "snapshot-map.tsv" if display == 0 else f"snapshot-map-d{display}.tsv")
     path = next((a for i, a in enumerate(args) if i not in skip and not a.startswith("-")), TREE)
     if not os.path.isfile(path):
         print(f"(no existe {path} — ejecuta: amctl tree)")
         return 1
 
-    pkg, nodes = parse(path)
+    pkg, nodes, empty_of = parse(path)
     picks = []
     for i, nd in enumerate(nodes):
         interactive = bool(nd["flags"] & {"clk", "edt", "chk"})
@@ -104,14 +119,21 @@ def main():
             continue
         picks.append((nd, label))
 
+    if empty_of:
+        d = display if display else empty_of.lstrip("d")
+        print(f"Pantalla — display {d}: vacío (sin ventanas propias). El servicio va bien: "
+              f"no hay nada en esa pantalla todavía. Lánzale algo con: amctl -d {d} launch <pkg>")
+        return 1
+
     if not picks:
-        print(f"Pantalla: {pkg or '?'} — sin elementos interactivos "
+        dtag = "" if display == 0 else f" — display {display}"
+        print(f"Pantalla{dtag}: {pkg or '?'} — sin elementos interactivos "
               "(¿servicio activado / app >= v1.0.8?)")
         return 1
 
     os.makedirs(CACHE, exist_ok=True)
     lines = []
-    with open(MAP, "w", encoding="utf-8") as mf:
+    with open(mapfile, "w", encoding="utf-8") as mf:
         for n, (nd, label) in enumerate(picks, 1):
             ref = f"p{n}"
             short_id = nd["id"].split("/")[-1] if nd["id"] else ""
@@ -135,7 +157,8 @@ def main():
                      f"\t{nd['r']}\t{nd['b']}\t{nd['id']}\t{label}\t{nd['win']}\n")
 
     mode = "todos" if all_mode else "interactivos"
-    print(f"Pantalla: {pkg or '?'} — {len(picks)} elementos ({mode}) de {len(nodes)} nodos")
+    dtag = "" if display == 0 else f" — display {display}"
+    print(f"Pantalla{dtag}: {pkg or '?'} — {len(picks)} elementos ({mode}) de {len(nodes)} nodos")
     for line in lines:
         print(line)
     if all_mode and len(picks) > 120:
