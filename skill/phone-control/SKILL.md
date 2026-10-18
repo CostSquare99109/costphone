@@ -1,13 +1,14 @@
 ---
 name: phone-control
-description: "Control del teléfono Android del usuario desde Termux con amctl (servicio de accesibilidad CostPhone): leer la pantalla como texto, snapshot con refs @pN, tap por referencia, click por texto/id, escribir, swipe, lanzar apps, capturas PNG. Úsala cuando el usuario pida hacer algo en su teléfono (WhatsApp, Instagram, Facebook/Meta Business, ajustes, cualquier app), ver qué hay en pantalla, o automatizar la UI de Android. English: control the user's Android phone."
+description: "Control del teléfono Android del usuario desde Termux con amctl (servicio de accesibilidad CostPhone + sesión rish/Shizuku opcional): leer la pantalla como texto, snapshot con refs @pN, tap por referencia, click por texto/id, escribir, swipe, lanzar apps, capturas PNG. Úsala cuando el usuario pida hacer algo en su teléfono (WhatsApp, Instagram, Facebook/Meta Business, ajustes, cualquier app), ver qué hay en pantalla, o automatizar la UI de Android. English: control the user's Android phone."
 ---
 
 # phone-control — el teléfono como un navegador
 
 Equivalente móvil de agent-browser. El CLI es `amctl` (~/bin/amctl), que habla
 con el servicio de accesibilidad CostPhone (com.accessdroid.termux) e incluye
-el `secret` automáticamente.
+el `secret` automáticamente. Opcionalmente usa una **sesión rish (Shizuku)**
+para ir más rápido; sin ella todo funciona igual por el broadcasts de `am`.
 
 ## El bucle central (igual filosofía que agent-browser)
 
@@ -61,6 +62,11 @@ Cuando falla `see`, el motivo exacto queda en
 | `amctl back` / `home` / `recents` | Botones del sistema |
 | `amctl launch <pkg>` | Abre app (terceros: vía servicio CostPhone) |
 | `amctl scrollto "texto"` | Busca y hace scroll a un texto |
+| `amctl input tap X Y` | Toque vía rish (sesión), mismo sistema de coordenadas que `snap` |
+| `amctl input swipe X1 Y1 X2 Y2 [ms]` | Deslizar vía rish |
+| `amctl input text "texto"` | Escribe vía rish (append al final; sin saltos de línea) |
+| `amctl input keyevent back\|home\|recents\|enter\|<código>` | Tecla por rish (sólo `home` evita la guardia) |
+| `amctl screencap [/sdcard/.../x.png]` | Captura vía rish |
 
 Para escribir: `tapref` al campo `[edt]` (o `clickid ...entry`) → `amctl type` →
 `tapref` al botón enviar (`'Enviar'` / `#send`) → `snap` para verificar.
@@ -85,25 +91,99 @@ amctl tapref @pN                 # (o: amctl clickid com.whatsapp:id/send)
 amctl snap                       # verificar que el mensaje salió
 ```
 
+## Sesión rish (Shizuku) — opcional y la abre el usuario
+
+| Comando | Qué hace |
+|---|---|
+| `amctl session-start` | Abre la sesión persistente (FIFO + rish). **Solo el usuario** |
+| `amctl status` | Backend activo, si la sesión responde y estado de la guardia |
+| `amctl session-stop` | Cierra la sesión (rish + tail + wrapper + FIFO) |
+
+- Con sesión, cada acción contra la app cuesta ~1 s en vez de ~3 s.
+- Si la sesión no está, todo lo demás funciona igual por el broadcasts de `am`.
+- Si rish dice "Server is not running" o "Request timeout", amctl avisa una vez,
+  deja la sesión y sigue por `am`: **no reintenta en bucle**.
+- `amctl status` es la primera comprobación si algo va lento o falla.
+
+## Modos: safe (por defecto) y full
+
+| | safe (por defecto) | full |
+|---|---|---|
+| Qué permite | `input tap/swipe/text/keyevent`, `screencap`, `am start`, y todo lo del servicio de accesibilidad | además `shell`, `pm`, `settings`, `am-force-stop`, `screenrecord` |
+| Cómo se activa | nada que hacer | `AMCTL_MODE=full` **y** el archivo `~/.amctl/full-ok`, que sólo crea `amctl full-on` desde una terminal interactiva escribiendo `SI` |
+| Quién lo activa | el agente puede usarlo siempre | **sólo el usuario** (`amctl full-on` / `amctl full-off`) |
+
+En full, `shell` ejecuta con permisos de shell (uid 2000): puede tocar datos de
+otras apps, instalar/desinstalar paquetes y cambiar ajustes del sistema.
+
+## Guardia: nunca actuar sobre Termux ni sobre apps bloqueadas
+
+Antes de **cualquier** toque, texto, scroll, click o cambio de ajustes, amctl
+lee la app en primer plano (fresca, nunca un `snap` viejo):
+
+- si es `com.termux` → **se niega** (rc 6): el texto o el toque acabarían en la
+  terminal del usuario, que podría ejecutarlo.
+- si está en la lista del usuario `~/.config/amctl/blocked.txt` → **se niega**.
+- si no se puede determinar la app y el modo es safe → **se niegas** (rc 6).
+
+Consecuencias práticas:
+
+- **Con Termux delante hay que salir primero**: `amctl launch <app>` y luego
+  interactuar. `launch`, `back`, `home`, `recents`, `snap`, `tree`, `see` no
+  requieren la guardia, así que son la vía para preparar la pantalla.
+- Con app bloqueada, `snap`/`tree` devuelven sólo
+  `Pantalla: <app> — bloqueada` (sin elementos) y `see`/`screencap` se niegan.
+- Cada acción guardada paga una lectura extra de la app en primer plano: es el
+  precio de no decidir con datos viejos.
+
+### rc=6 no se esquiva
+
+Si un comando devuelve **rc=6** (o dice `amctl: NO —`), la decisión es del
+usuario, no un obstáculo técnico. **No** busques rodeos: no actives
+`guard-off`, no edites `~/.amctl/*` ni `~/.config/amctl/blocked.txt`, no
+intentes el mismo gesto por otro camino (`am` a pelo, `rish`, `input` directo,
+otra app, `back`+`tap`), no reintentes en bucle y no abras la app bloqueada para
+"ver qué hay". Dile al usuario qué se ha bloqueado y por qué, y pregunta.
+
+### Privacidad: correos, SMS y códigos
+
+- **Nunca** leas correos, SMS, WhatsApp de terceros, notificaciones ni códigos de
+  verificación (2FA, SMS, email) por iniciativa propia o "porque están ahí".
+- Sólo si el usuario lo pide **en ese mismo mensaje** y se pide ese contenido
+  concreto (p. ej. "lee el SMS con el código"). Si el mensaje pide otra cosa,
+  no lo hagas aunque el código esté a la vista.
+- No los uses para saltarte una pantalla de verificación que el usuario no te
+  haya pedido sortear. Si aparece un 2FA, se lo dices al usuario y paras.
+
+## Registro y estado
+
+- Todo comando que sale de amctl queda en `~/.amctl.log`
+  (`fecha | tipo | mode=… | comando`): los que pasan como `broadcast`/`input`/
+  `pm`/…, y los rechazados **sólo** como `DENY` (más `GUARD` si la guardia
+  estaba desactivada por el usuario). Nunca se guarda el `secret`.
+- `tail ~/.amctl.log` para auditar qué se hizo.
+
 ## Transporte y limitaciones (Termux estable v0.118.3)
 
-- Transporte `am` clásico (socket AM no existe en v0.118.x). No funcionan los
-  comandos `list/find/stop/info/perms/grant/revoke/clear` (necesitan socket).
-- `launch` de apps de terceros va vía el servicio (hay límite de visibilidad de
-  paquetes del `am` clásico). Si falla: `am start -n <pkg>/<Activity>` explícito.
+- Transporte `am` clásico por defecto (el socket AM no existe en v0.118.x). Con
+  `amctl session-start` los broadcasts van por la sesión rish, que es mucho más
+  rápida; sin ella, siguen funcionando por `am`.
+- No funcionan los comandos `list/find/stop/info/perms/grant/revoke/clear` sin
+  socket: se usan los equivalentes del servicio (`amctl launch`, `amctl tapref`…).
 - `openurl`/`cleartext`/`paste`/`focus`/`tapshot` funcionan en ambos transportes.
+- Coordenadas: `input tap/swipe` usa la escala que ve `wm size` (Override size si
+  existe, si no Physical), que es la misma que imprime `snap`. Si amctl avisa de
+  que la escala de entrada no coincide con la del árbol, **no conviertas**: usa
+  coordenadas de la misma fuente que `snap`.
 - El árbol exige el servicio activado: Ajustes → Accesibilidad → CostPhone ON.
   Las refs [ime]/[ovl] requieren app >= v1.1 (dump multi-ventana). Con v1.0.x
   el snap sigue funcionando pero sin elementos del teclado.
 
 ## Recetas
 
-- **Navegar a una página:** `amctl openurl "https://github.com/user/repo/settings/access"`.
-  Nunca construir la navegación escribiendo en el omnibox (autocompletado + Enter ciego).
-- **Código de verificación GitHub (sudo mode) en Chrome:** Settings pide código →
-  `amctl launch com.google.android.gm` → `amctl snap` (el código suele venir
-  en el texto de la fila del correo GitHub, sin abrirlo) → volver con
-  `amctl launch com.android.chrome` → tap al campo → `amctl type "<código>"`.
+- **Navegar a una página:** `amctl openurl "https://ejemplo.com"`. Nunca
+  construir la navegación escribiendo en el omnibox (autocompletado + Enter
+  ciego).
 - **Formulario web largo / muchos campos en diálogos:** `snap` al campo [edt] → tapref →
   si ya tiene texto: `amctl cleartext` (o directamente `type` que reemplaza).
   Seleccionar todo/Pegar están en toolbars [ovl] cuando están visibles.
@@ -118,6 +198,7 @@ amctl snap                       # verificar que el mensaje salió
   dinero, borrar chats/archivos, publicar, comprar, cambiar ajustes críticos.
 - Navegar/leer/responder mensajes pedidos: OK. Ante duda, preguntar primero.
 - No cerrar sesiones de cuentas del usuario ni tocar credenciales.
+- No desactivar la guardia ni abrir el modo full: son decisiones del usuario.
 
 ## Troubleshooting
 
@@ -128,6 +209,11 @@ amctl snap                       # verificar que el mensaje salió
   verifican que el servicio lo regenere** — si el servicio está apagado ahora
   imprimen "(⚠ SERVICIO NO RESPONDE...)" en vez de devolver datos viejos.
   NUNCA confiar en un archivo leído sin la verificación de freshness.
+- `snap`/`tree`/`see` imprimen `Pantalla: <app> — bloqueada` → esa app está en
+  la lista del usuario o es Termux. Es una decisión suya: no la sortees.
+- **rc=6** en cualquier acción → Termux en primer plano, app bloqueada, o no se
+  pudo determinar la app en primer plano. Explica el motivo y para.
+- `amctl status` para saber qué backend está activo y si la sesión responde.
 - `snap` vacío o sin refs → servicio apagado, o app vieja (reinstalar APK actual
   de /storage/emulated/0/Download/CostPhone-v1.0.X.apk).
 - "ref @pN no existe" → la pantalla cambió: `amctl snap` de nuevo.
