@@ -15,9 +15,28 @@
 #             list / find / stop / info / perms / grant / revoke / clear.
 #
 # Usage: amctl <command> [args...]
+#   AMCTL_MODE=safe (por defecto) — solo:
+#   input tap X Y                  Toque (coords de 'amctl snap')
+#   input swipe X1 Y1 X2 Y2 [ms]   Deslizar
+#   input text TEXTO               Escribir (nunca se ejecuta como shell)
+#   input keyevent CODIGO          Tecla (número o back/home/recents/enter/...)
+#   screencap [/sdcard/...png]     Captura por Shizuku
+#   launch <paquete>               am start por la sesión rish
+#   guard-off / guard-on         Desactiva/reactiva la guardia (tú, en terminal)
+#   full-on / full-off           Habilita/deshabilita el modo full (tú, en terminal)
+#   modo full añade (AMCTL_MODE=full, solo con ~/.amctl/full-ok):
+#   shell CMD... | pm ... | settings ... | am-force-stop <pkg> | screenrecord ...
+#
 #   session-start            Abre la sesión rish persistente (FIFO) — solo tú
 #   session-stop             Cierra la sesión rish (rish + tail + FIFO)
 #   status                   Backend activo + si la sesión responde
+#   registro                 cada comando queda en ~/.amctl.log
+#   lista de bloqueo         ~/.config/amctl/blocked.txt (una app por línea)
+#   guardia                  todo tap/type/swipe/click/... va contra la app en primer
+#                            plano: se lee fresca (nunca un snap viejo); con Termux
+#                            delante o app bloqueada se niega, y si no se puede saber
+#                            en modo safe también. Con app bloqueada, snap/tree solo
+#                            dicen "Pantalla: <app> — bloqueada" y screencap se niega.
 #   list     [query]            List 3rd-party apps (socket only)
 #   find     <name>             Search apps by label (socket only)
 #   launch   <app|pkg>          Launch an app (use package name without socket)
@@ -166,15 +185,15 @@ shquote() {
     printf "'%s'" "$s"
 }
 
-# run a command in the session and wait for ITS marker.
+# run a prepared command line in the session and wait for ITS marker.
+# The output produced before the marker is left in SESSION_OUT.
 # rc 0 ok | 2 rish died / "Server is not running" / "Request timeout" | 3 no answer
-session_run() {
-    local -a argv=( "$@" )
-    local marker line off chunk a pid deadline
+_session_exec() {
+    local line="$1"
+    local marker off chunk pid deadline
     marker=$(new_marker)
-    line=''
-    for a in "${argv[@]}"; do line+=" $(shquote "$a")"; done
     line+=" ; echo $(shquote "$marker")"
+    SESSION_OUT=""
     pid=$(session_rish_pid) || return 2
     [[ -p "$AMCTL_FIFO" && -f "$AMCTL_OUT" ]] || return 2
     off=$(wc -c < "$AMCTL_OUT" 2>/dev/null) || off=0
@@ -184,7 +203,10 @@ session_run() {
     deadline=$(( NOW_MS + ${AMCTL_MARKER_WAIT%%.*} * 1000 ))
     while :; do
         chunk=$(tail -c "+$((off + 1))" "$AMCTL_OUT" 2>/dev/null)
-        [[ "$chunk" == *"$marker"* ]] && return 0
+        if [[ "$chunk" == *"$marker"* ]]; then
+            SESSION_OUT="${chunk%$marker*}"
+            return 0
+        fi
         case "$chunk" in
             *"Server is not running"*|*"Request timeout"*) return 2 ;;
         esac
@@ -196,19 +218,25 @@ session_run() {
     return 3
 }
 
-# warn once and retire a broken session: never retried in a loop
-session_drop() {
-    session_retire
-    echo "amctl: sesión rish no usable ($1) — cae a 'am' clásico; 'amctl session-start' para reabrirla." >&2
+# argv form: every argument is single-quoted (never re-parsed by the remote shell)
+session_run() {
+    local a line=''
+    for a in "$@"; do line+=" $(shquote "$a")"; done
+    _session_exec "$line"
 }
 
-# kill tail first (rish then sees EOF and exits), then rish; clean FIFO/pidfiles
-session_retire() {
-    local p
-    if p=$(session_tail_pid); then session_owner_tail "$p" && kill "$p" 2>/dev/null; fi
-    if p=$(session_rish_pid); then session_owner_rish "$p" && kill "$p" 2>/dev/null; fi
-    rm -f "$AMCTL_FIFO" "$AMCTL_PID" "$AMCTL_KEEP_PID" 2>/dev/null
-    return 0
+# fixed internal pipelines only (never called with user data)
+session_raw() { _session_exec "$1"; }
+
+# warn once and retire a broken session: never retried in a loop
+# $2 = 'noretry' when the caller has no classic-am fallback
+session_drop() {
+    session_retire
+    if [[ "${2:-}" == noretry ]]; then
+        echo "amctl: sesión rish no usable ($1) — comando descartado; 'amctl session-start' para reabrirla." >&2
+    else
+        echo "amctl: sesión rish no usable ($1) — cae a 'am' clásico; 'amctl session-start' para reabrirla." >&2
+    fi
 }
 
 session_probe() {
@@ -222,9 +250,298 @@ session_probe() {
     return "$rc"
 }
 
-# ---- send a raw broadcast to AccessDroid (always carries the secret) ----
-# session first (if the user started one), classic am otherwise
-bc() {
+# ===================== B2: Shizuku commands (AMCTL_MODE) =====================
+# safe (default): only input tap/swipe/text/keyevent, screencap and am start.
+# full (user only): adds shell, pm, settings, am force-stop and screenrecord.
+AMCTL_MODE="${AMCTL_MODE:-safe}"
+[[ "$AMCTL_MODE" == safe || "$AMCTL_MODE" == full ]] || { echo "amctl: AMCTL_MODE inválido '$AMCTL_MODE' (safe|full)" >&2; exit 2; }
+AMCTL_LOG="$HOME/.amctl.log"
+AMCTL_BLOCKED="$HOME/.config/amctl/blocked.txt"
+AMCTL_SIZE_CACHE="$AMCTL_DIR/size"
+AMCTL_SCALE_CACHE="$AMCTL_DIR/scale"
+AMCTL_ACK="$AMCTL_DIR/full-ok"
+AMCTL_GUARD_OFF="$AMCTL_DIR/guard-off"
+AMCTL_SIZE_TTL="${AMCTL_SIZE_TTL:-300}"
+AMCTL_PKG_RE='^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$'
+SESSION_OUT=""
+FG_DENY=""
+
+# every command that leaves amctl is recorded here (never the secret)
+amctl_log() {
+    local kind="$1"; shift
+    printf '%s | %s | mode=%s | %s\n' "$(date '+%F %T')" "$kind" "$AMCTL_MODE" "$*" >> "$AMCTL_LOG" 2>/dev/null
+    local n
+    n=$(stat -c%s "$AMCTL_LOG" 2>/dev/null) || return 0
+    if [[ -n "$n" && "$n" -gt 1048576 ]]; then
+        tail -n 500 "$AMCTL_LOG" > "$AMCTL_LOG.1" 2>/dev/null
+    fi
+    return 0
+}
+
+need_session() {
+    session_alive && return 0
+    echo "amctl $1: necesita la sesión rish — abrela con: amctl session-start" >&2
+    return 4
+}
+
+# full mode: the user enables it once, interactively (see 'amctl full-on').
+# Neither AMCTL_MODE=full nor any env var can create the marker.
+need_full() {
+    local cmd="$1"
+    if [[ "$AMCTL_MODE" != full || ! -f "$AMCTL_ACK" ]]; then
+        amctl_log DENY "$cmd (modo full no habilitado)"
+        echo "amctl $cmd: no disponible (requiere modo full habilitado por el usuario)." >&2
+        return 4
+    fi
+    return 0
+}
+
+# kill tail first (rish then sees EOF and exits), then rish; clean FIFO/pidfiles
+session_retire() {
+    local p
+    if p=$(session_tail_pid); then session_owner_tail "$p" && kill "$p" 2>/dev/null; fi
+    if p=$(session_rish_pid); then session_owner_rish "$p" && kill "$p" 2>/dev/null; fi
+    rm -f "$AMCTL_FIFO" "$AMCTL_PID" "$AMCTL_KEEP_PID" 2>/dev/null
+    return 0
+}
+
+# run an allow-listed remote command through the session
+# $1 = optional extra seconds to wait for the marker
+sh_exec() {
+    local wait="$1"; shift
+    local saved="$AMCTL_MARKER_WAIT" rc=0
+    AMCTL_MARKER_WAIT="$wait"
+    session_run "$@" || rc=$?
+    AMCTL_MARKER_WAIT="$saved"
+    case "$rc" in
+        0) return 0 ;;
+        2) session_drop "rish: Server is not running / Request timeout / rish muerto" noretry; return 1 ;;
+        *) session_drop "sin marcador en ${AMCTL_MARKER_WAIT}s" noretry; return 1 ;;
+    esac
+}
+
+# ---- display size: 'Override size' if set, else 'Physical size' (cached) ----
+wm_size() {
+    now_ms
+    if [[ -f "$AMCTL_SIZE_CACHE" ]]; then
+        local c sz ts
+        c=$(cat "$AMCTL_SIZE_CACHE" 2>/dev/null) || c=''
+        sz="${c%%|*}"; ts="${c##*|}"
+        if [[ "$sz" =~ ^[0-9]+x[0-9]+$ && "$ts" =~ ^[0-9]+$ ]] && (( NOW_MS - ts <= AMCTL_SIZE_TTL * 1000 )); then
+            printf '%s' "$sz"
+            return 0
+        fi
+    fi
+    local out sz
+    session_raw 'wm size 2>/dev/null' || return 1
+    out="$SESSION_OUT"
+    sz=$(printf '%s\n' "$out" | sed -n 's/.*Override size: *\([0-9]*x[0-9]*\).*/\1/p' | head -1)
+    if [[ -z "$sz" ]]; then
+        sz=$(printf '%s\n' "$out" | sed -n 's/.*Physical size: *\([0-9]*x[0-9]*\).*/\1/p' | head -1)
+    fi
+    [[ "$sz" =~ ^[0-9]+x[0-9]+$ ]] || return 1
+    mkdir -p "$AMCTL_DIR" 2>/dev/null
+    printf '%s|%s\n' "$sz" "$NOW_MS" > "$AMCTL_SIZE_CACHE" 2>/dev/null
+    printf '%s' "$sz"
+}
+
+# scale of the coordinates that 'amctl snap' prints: max bounds of the last tree
+snap_scale() {
+    now_ms
+    if [[ -f "$AMCTL_SCALE_CACHE" ]]; then
+        local c sz ts
+        c=$(cat "$AMCTL_SCALE_CACHE" 2>/dev/null) || c=''
+        sz="${c%%|*}"; ts="${c##*|}"
+        if [[ "$sz" =~ ^[0-9]+x[0-9]+$ && "$ts" =~ ^[0-9]+$ ]] && (( NOW_MS - ts <= AMCTL_SIZE_TTL * 1000 )); then
+            printf '%s' "$sz"
+            return 0
+        fi
+    fi
+    local f=/sdcard/Download/accessdroid-tree.txt line maxw=0 maxh=0
+    [[ -f "$f" ]] || return 1
+    while IFS= read -r line; do
+        if [[ "$line" =~ bounds=\[([0-9]+),([0-9]+)\]\[([0-9]+),([0-9]+)\] ]]; then
+            (( BASH_REMATCH[4] > maxw )) && maxw=${BASH_REMATCH[4]}
+            (( BASH_REMATCH[5] > maxh )) && maxh=${BASH_REMATCH[5]}
+        fi
+    done < "$f"
+    (( maxw > 0 )) || return 1
+    printf '%sx%s' "$maxw" "$maxh"
+    mkdir -p "$AMCTL_DIR" 2>/dev/null
+    printf '%sx%s|%s\n' "$maxw" "$maxh" "$NOW_MS" > "$AMCTL_SCALE_CACHE" 2>/dev/null
+    return 0
+}
+
+# warn (never convert) when input scale and snap scale disagree
+scale_guard() {
+    local wm snap dw wh sw sh_ d
+    wm=$(wm_size) || { echo "aviso: no pude leer 'wm size' — mando las coordenadas tal cual" >&2; return 0; }
+    snap=$(snap_scale) || return 0
+    dw=${wm%x*}; wh=${wm#*x}; sw=${snap%x*}; sh_=${snap#*x}
+    [[ "$dw" == "$sw" ]] || { d=1; }
+    if [[ -z "${d:-}" ]] && [[ "$wh" =~ ^[0-9]+$ && "$sh_" =~ ^[0-9]+$ && "$wh" -gt 0 ]]; then
+        (( (wh - sh_) * 100 / wh <= 2 )) || d=1
+        (( (sh_ - wh) * 100 / wh <= 2 )) || d=1
+    fi
+    if [[ -n "${d:-}" ]]; then
+        echo "⚠ escala de entrada $wm ≠ escala del árbol de snap $snap" >&2
+        echo "  NO convierto: usa coordenadas de la misma fuente que las de 'amctl snap'." >&2
+    fi
+    return 0
+}
+
+# foreground package, read fresh every time (never a stale tree/snap):
+#   with a session  -> 'dumpsys window | grep mCurrentFocus'
+#   without one     -> fresh ACTION_GET_UI_TREE broadcast, first line '# pkg='
+#   (the classic 'am' cannot run dumpsys, so the tree is the fallback)
+fg_pkg() {
+    local out
+    if session_alive; then
+        session_raw "dumpsys window 2>/dev/null | grep -m1 -E 'mCurrentFocus|mFocusedApp' | grep -m1 -oE '[a-zA-Z0-9_]+[.][a-zA-Z0-9_.]+/[a-zA-Z0-9_.]+'" || :
+        out="$SESSION_OUT"
+        if [[ "$out" =~ ^([A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+)/ ]]; then
+            printf '%s' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    fi
+    local f=/sdcard/Download/accessdroid-tree.txt line
+    rm -f "$f" 2>/dev/null
+    bc_raw com.accessdroid.termux.ACTION_GET_UI_TREE || return 1
+    wait_file "$f" 5 || return 1
+    IFS= read -r line < "$f" || return 1
+    [[ "$line" =~ ^\#[[:space:]]*pkg=([A-Za-z0-9_.]+)[[:space:]]*$ ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# only the write end of ~/.config/amctl/blocked.txt is read; it is never modified
+# returns 0 when the foreground package is blocked (or is Termux)
+blocked_match() {
+    local fg="$1" pat
+    [[ -f "$AMCTL_BLOCKED" ]] || return 1
+    while IFS= read -r pat || [[ -n "$pat" ]]; do
+        pat="${pat%%#*}"
+        pat="${pat//[[:space:]]/}"
+        [[ -z "$pat" ]] && continue
+        [[ "$fg" == $pat ]] && return 0
+    done < "$AMCTL_BLOCKED"
+    return 1
+}
+
+# the guard: before every broadcast that can act on the foreground app
+guard_action() {
+    local what="$1" fg
+    if [[ -f "$AMCTL_GUARD_OFF" ]]; then
+        amctl_log GUARD "guard-off activo — guardia desactivada ($what)"
+        return 0
+    fi
+    fg=$(fg_pkg) || fg=''
+    if [[ -z "$fg" ]]; then
+        amctl_log DENY "$what (app en primer plano desconocida)"
+        if [[ "$AMCTL_MODE" == safe ]]; then
+            echo "amctl: NO — no pude determinar la app en primer plano; el modo seguro bloquea '$what'." >&2
+            return 6
+        fi
+        echo "aviso: app en primer plano desconocida (modo $AMCTL_MODE): '$what' pasa sin comprobación" >&2
+        return 0
+    fi
+    if [[ "$fg" == com.termux ]]; then
+        amctl_log DENY "$what (foreground=$fg anti-Termux)"
+        echo "amctl: NO — Termux está en primer plano (guarda anti-Termux)." >&2
+        echo "  Lanza otra app antes de interactuar: amctl launch <paquete>" >&2
+        return 6
+    fi
+    if blocked_match "$fg"; then
+        amctl_log DENY "$what (foreground=$fg bloqueada)"
+        echo "amctl: NO — '$fg' está en tu lista bloqueada ($AMCTL_BLOCKED)" >&2
+        return 6
+    fi
+    return 0
+}
+
+# silent variant for read-only commands (snap/tree/screencap): same decision,
+# but without revealing the contents of a blocked app
+guard_readonly() {
+    local what="$1" fg
+    if [[ -f "$AMCTL_GUARD_OFF" ]]; then
+        amctl_log GUARD "guard-off activo — guardia desactivada ($what)"
+        return 0
+    fi
+    fg=$(fg_pkg) || fg=''
+    if [[ -z "$fg" ]]; then
+        amctl_log DENY "$what (app en primer plano desconocida)"
+        if [[ "$AMCTL_MODE" == safe ]]; then
+            echo "amctl: NO — no pude determinar la app en primer plano; el modo seguro bloquea '$what'." >&2
+            return 6
+        fi
+        echo "aviso: app en primer plano desconocida (modo $AMCTL_MODE): '$what' sin comprobación" >&2
+        return 0
+    fi
+    if [[ "$fg" == com.termux ]]; then
+        amctl_log DENY "$what (foreground=$fg anti-Termux)"
+        echo "Pantalla: Termux — bloqueada"
+        return 6
+    fi
+    if blocked_match "$fg"; then
+        amctl_log DENY "$what (foreground=$fg bloqueada)"
+        echo "Pantalla: $fg — bloqueada"
+        return 6
+    fi
+    return 0
+}
+
+num_arg() {
+    [[ "$1" =~ ^[0-9]+$ ]] || { echo "amctl: '$1' no es un entero >= 0" >&2; return 1; }
+    printf -v "$2" '%s' "$1"
+}
+
+# only warns when a point is clearly off-screen: never rescales
+bounds_check() {
+    local x="$1" y="$2" wm dw dh
+    wm=$(wm_size) || return 0
+    dw=${wm%x*}; dh=${wm#*x}
+    [[ "$dw" =~ ^[0-9]+$ && "$dh" =~ ^[0-9]+$ ]] || return 0
+    if (( x >= dw || y >= dh )); then
+        echo "aviso: ($x,$y) cae fuera de ${wm} — lo envío igual, sin convertir" >&2
+    fi
+    return 0
+}
+
+out_path_ok() {
+    case "$1" in
+        */../*|*/..|*/./*)
+            echo "amctl: ruta de salida con '..' o '.' no permitida" >&2
+            return 1 ;;
+    esac
+    [[ "$1" =~ ^/sdcard/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*\.(png|jpg)$ ]] || {
+        echo "amctl: ruta de salida inválida (usa /sdcard/Download/archivo.png)" >&2
+        return 1
+    }
+    return 0
+}
+
+# actions that never touch the foreground app content, so they skip the guard:
+#   - read-only tree/screenshot
+#   - pure navigation keys (back/home/recents): no text, no content change, and
+#     they are the only way out of Termux
+action_exempt() {
+    local a="$1"; shift
+    case "$a" in
+        *GET_UI_TREE|*SCREENDUMP|*ACTION_BACK|*ACTION_HOME|*ACTION_RECENTS) return 0 ;;
+        *ACTION_PRESS_KEY)
+            local prev='' x
+            for x in "$@"; do
+                if [[ "$prev" == keyCode && ( "$x" == 3 || "$x" == 4 || "$x" == 187 ) ]]; then
+                    return 0
+                fi
+                prev="$x"
+            done
+            return 1 ;;
+    esac
+    return 1
+}
+
+# ---- raw broadcast to AccessDroid, no guard (used by the guard itself) ----
+bc_raw() {
     # $1 = action, rest are --es/--ei/--el extras
     local action="$1"; shift
     if session_alive; then
@@ -241,15 +558,28 @@ bc() {
     tam broadcast -p "$PKG" -a "$action" --es secret "$SECRET" "$@" >/dev/null 2>&1
 }
 
+# ---- guarded broadcast: every action that can act on the foreground app ----
+bc() {
+    # $1 = action, rest are --es/--ei/--el extras
+    local action="$1"; shift
+    amctl_log broadcast "$action"
+    if ! action_exempt "$action" "$@"; then
+        guard_action "$action" || return $?
+    fi
+    bc_raw "$action" "$@"
+}
+
 # ---- send a command to the AccessibilityService and report errors ----
 ac() {
     local action="$1"; shift
-    if ! bc "$action" "$@"; then
-        echo "ERROR: failed to send command '$action'." >&2
-        echo "Is AccessDroid's accessibility service enabled?" >&2
-        echo "Settings -> Accessibility -> AccessDroid -> ON" >&2
-        return 3
-    fi
+    local rc=0
+    bc "$action" "$@" || rc=$?
+    [[ $rc == 0 ]] && return 0
+    [[ $rc == 6 ]] && return 6
+    echo "ERROR: failed to send command '$action'." >&2
+    echo "Is AccessDroid's accessibility service enabled?" >&2
+    echo "Settings -> Accessibility -> AccessDroid -> ON" >&2
+    return 3
 }
 
 # ---- wait until a file exists with a stable size ----
@@ -372,6 +702,9 @@ cmd_status() {
     echo "sesión rish   : $sess"
     echo "backend activo: $backend"
     echo "prueba        : $probe"
+    local gst="activa"
+    [[ -f "$AMCTL_GUARD_OFF" ]] && gst="DESACTIVADA por el usuario"
+    echo "guardia       : $gst"
     echo "salida sesión : $AMCTL_OUT"
 }
 
@@ -402,6 +735,18 @@ cmd_find() {
 }
 
 cmd_launch() {
+    # with a live session: plain 'am start' through the pipe (~0.8s, no socket)
+    if session_alive; then
+        local sp="${1:-}"
+        if [[ "$sp" =~ $AMCTL_PKG_RE ]]; then
+            amctl_log launch "am start -p $sp (sesión)"
+            if sh_exec "$AMCTL_MARKER_WAIT" am start --user 0 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p "$sp"; then
+                echo "Launched $sp (sesión rish)"
+                return 0
+            fi
+            echo "aviso: 'am start' por sesión falló — uso la vía clásica" >&2
+        fi
+    fi
     if [[ "$TRANSPORT" == "socket" ]]; then
         local pkg; pkg=$(resolve_pkg "$1") || return $?
         local comp
@@ -441,8 +786,8 @@ cmd_perms()  { need_socket perms || return $?; local pkg; pkg=$(resolve_pkg "$1"
 cmd_grant()  { need_socket grant || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; shift; local perm="$1"; tam pm grant "$pkg" "$perm" 2>/dev/null && echo "Granted $perm to $pkg"; }
 cmd_revoke() { need_socket revoke || return $?; local p; p=$(resolve_pkg "$1") || return $?; shift; local perm; tam pm revoke "${p}" "${1:-}" 2>/dev/null; }
 cmd_clear()  { need_socket clear || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam clear package "$pkg" 2>/dev/null && echo "Cleared $pkg"; }
-cmd_tree()   { local f=/sdcard/Download/accessdroid-tree.txt; rm -f "$f"; bc com.accessdroid.termux.ACTION_GET_UI_TREE; wait_file "$f" 5 && { cat "$f"; return 0; }; echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)"; return 1; }
-cmd_snap()   { local f=/sdcard/Download/accessdroid-tree.txt; rm -f "$f"; bc com.accessdroid.termux.ACTION_GET_UI_TREE; wait_file "$f" 5 || { echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2; return 1; }; python3 "$HOME/bin/amctl-snap.py" "$@"; }
+cmd_tree()   { local f=/sdcard/Download/accessdroid-tree.txt; guard_readonly tree || return $?; rm -f "$f"; bc_raw com.accessdroid.termux.ACTION_GET_UI_TREE; wait_file "$f" 5 && { cat "$f"; return 0; }; echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)"; return 1; }
+cmd_snap()   { local f=/sdcard/Download/accessdroid-tree.txt; guard_readonly snap || return $?; rm -f "$f"; bc_raw com.accessdroid.termux.ACTION_GET_UI_TREE; wait_file "$f" 5 || { echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2; return 1; }; python3 "$HOME/bin/amctl-snap.py" "$@"; }
 
 cmd_tapref() {
     local ref="${1:-}"
@@ -549,8 +894,269 @@ cmd_float() {
     echo "float: $target -> ventana flotante"
 }
 
+# ========================= B2 subcommands =========================
+
+cmd_input() {
+    local sub="${1:-}"
+    case "$sub" in
+        tap|swipe|text|keyevent) ;;
+        "") echo "uso: amctl input tap X Y | swipe X1 Y1 X2 Y2 [ms] | text TEXTO | keyevent CODIGO" >&2; return 2 ;;
+        *) echo "amctl input: subcomando '$sub' no permitido (modo $AMCTL_MODE)" >&2; return 2 ;;
+    esac
+    shift || true
+    need_session "input $sub" || return $?
+    # only HOME escapes the guard: it is the key that leaves Termux
+    if [[ "$sub" == keyevent && "${1:-}" == home ]]; then
+        amctl_log input "input keyevent 3 (HOME, sin guardia)"
+        sh_exec "$AMCTL_MARKER_WAIT" input keyevent 3 && echo "keyevent 3 (HOME) [sesión rish]"
+        return 0
+    fi
+    guard_action "input $sub" || return $?
+    scale_guard
+    case "$sub" in
+        tap)
+            local x y
+            num_arg "${1:-}" x || return 2
+            num_arg "${2:-}" y || return 2
+            bounds_check "$x" "$y"
+            amctl_log input "input tap $x $y"
+            sh_exec "$AMCTL_MARKER_WAIT" input tap "$x" "$y" && echo "tap ($x,$y) [sesión rish]"
+            ;;
+        swipe)
+            local x1 y1 x2 y2 ms
+            num_arg "${1:-}" x1 || return 2
+            num_arg "${2:-}" y1 || return 2
+            num_arg "${3:-}" x2 || return 2
+            num_arg "${4:-}" y2 || return 2
+            ms="${5:-300}"
+            num_arg "$ms" ms || return 2
+            (( ms > 8000 )) && { echo "amctl: duración de swipe > 8000ms no permitida" >&2; return 2; }
+            amctl_log input "input swipe $x1 $y1 $x2 $y2 $ms"
+            sh_exec "$AMCTL_MARKER_WAIT" input swipe "$x1" "$y1" "$x2" "$y2" "$ms" && echo "swipe ($x1,$y1)->($x2,$y2) ${ms}ms [sesión rish]"
+            ;;
+        text)
+            local t="$*" esc
+            [[ -z "$t" ]] && { echo "uso: amctl input text TEXTO" >&2; return 2; }
+            (( ${#t} > 500 )) && { echo "amctl: texto demasiado largo (máx 500)" >&2; return 2; }
+            if [[ "$t" == *[$'\x01'-$'\x1f'$'\x7f']* ]]; then
+                echo "amctl: el texto contiene caracteres de control (incluye saltos de línea): no se envía" >&2
+                return 2
+            fi
+            [[ "$t" =~ [^[:print:][:space:]] ]] && echo "aviso: 'input text' no maneja bien no-ASCII; puede salir incompleto" >&2
+            esc=${t// /%s}
+            amctl_log input "input text (${#t} chars)"
+            sh_exec "$AMCTL_MARKER_WAIT" input text "$esc" && echo "texto enviado (${#t} chars) [sesión rish]"
+            ;;
+        keyevent)
+            local k="${1:-}" code=''
+            [[ -z "$k" ]] && { echo "uso: amctl input keyevent CODIGO" >&2; return 2; }
+            case "$k" in
+                back) code=4 ;; home) code=3 ;; recents|app_switch) code=187 ;;
+                enter) code=66 ;; del|backspace) code=67 ;; tab) code=61 ;;
+                volume_up) code=24 ;; volume_down) code=25 ;; power) code=26 ;;
+                *) num_arg "$k" code || { echo "amctl input keyevent: código o nombre desconocido" >&2; return 2; } ;;
+            esac
+            amctl_log input "input keyevent $code"
+            sh_exec "$AMCTL_MARKER_WAIT" input keyevent "$code" && echo "keyevent $code [sesión rish]"
+            ;;
+    esac
+}
+
+cmd_screencap() {
+    local out="${1:-/sdcard/Download/amctl-shizuku.png}"
+    need_session screencap || return $?
+    out_path_ok "$out" || return 2
+    guard_readonly screencap || return $?
+    amctl_log screencap "screencap -p $out"
+    sh_exec "$AMCTL_MARKER_WAIT" screencap -p "$out" && echo "PNG: $out"
+}
+
+# ---------- guard switch: toggled here, by the user, interactively ----------
+
+cmd_guard_off() {
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        amctl_log DENY "guard-off (sin terminal interactiva)"
+        echo "amctl guard-off: solo desde una terminal interactiva." >&2
+        return 5
+    fi
+    if [[ -f "$AMCTL_GUARD_OFF" ]]; then
+        echo "la guardia ya estaba desactivada ($AMCTL_GUARD_OFF)"
+        return 0
+    fi
+    {
+        echo "════════ VAS A DESACTIVAR LA GUARDIA ════════"
+        echo "La guardia impide tocar la pantalla mientras Termux está delante o"
+        echo "la app en primer plano está en tu lista bloqueada, y bloquea todo"
+        echo "cuando no se puede saber qué app es. Sin ella, cualquier toque o"
+        echo "texto puede acabar en la terminal de Termux."
+        echo "Escribe SI para desactivarla (cualquier otra cosa lo cancela)."
+    }
+    local ans=''
+    read -r ans || ans=''
+    if [[ "$ans" != SI ]]; then
+        echo "cancelado: la guardia sigue activa"
+        return 5
+    fi
+    mkdir -p "$AMCTL_DIR" || return 1
+    : > "$AMCTL_GUARD_OFF" || return 1
+    amctl_log guard "guardia desactivada por el usuario"
+    echo "guardia desactivada. Reactívala con: amctl guard-on"
+    return 0
+}
+
+cmd_guard_on() {
+    if [[ -f "$AMCTL_GUARD_OFF" ]]; then
+        rm -f "$AMCTL_GUARD_OFF"
+        amctl_log guard "guardia reactivada por el usuario"
+        echo "guardia activa"
+    else
+        echo "la guardia ya estaba activa"
+    fi
+    return 0
+}
+
+# ---------- full mode: enabled here, by the user, interactively ----------
+
+cmd_full_on() {
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        amctl_log DENY "full-on (sin terminal interactiva)"
+        echo "amctl full-on: solo desde una terminal interactiva." >&2
+        return 5
+    fi
+    if [[ "$AMCTL_MODE" != full ]]; then
+        echo "amctl full-on: ejecútalo con AMCTL_MODE=full para activar el modo completo." >&2
+        return 4
+    fi
+    if [[ -f "$AMCTL_ACK" ]]; then
+        echo "modo full ya habilitado ($AMCTL_ACK)"
+        return 0
+    fi
+    {
+        echo "════════ VAS A HABILITAR EL MODO FULL ════════"
+        echo "Con él, amctl puede ejecutar shell, pm, settings, force-stop y"
+        echo "screenrecord con permisos de shell (uid 2000): puede tocar datos"
+        echo "de otras apps, instalar o desinstalar paquetes y cambiar ajustes"
+        echo "del sistema. Un agente con este modo puede romper el móvil."
+        echo "Escribe SI para activarlo (cualquier otra cosa lo cancela)."
+    }
+    local ans=''
+    read -r ans || ans=''
+    if [[ "$ans" != SI ]]; then
+        echo "cancelado: modo full no habilitado"
+        return 5
+    fi
+    mkdir -p "$AMCTL_DIR" || return 1
+    : > "$AMCTL_ACK" || return 1
+    amctl_log full "modo full habilitado por el usuario"
+    echo "modo full habilitado. El agente NO debe usar estos comandos."
+    return 0
+}
+
+cmd_full_off() {
+    if [[ -f "$AMCTL_ACK" ]]; then
+        rm -f "$AMCTL_ACK"
+        echo "modo full deshabilitado"
+    else
+        echo "el modo full ya estaba deshabilitado"
+    fi
+    return 0
+}
+
+# ---------- full mode only (user activated, never the agent) ----------
+
+cmd_shell() {
+    need_full "shell" || return $?
+    need_session "shell" || return $?
+    [[ $# -gt 0 ]] || { echo "uso: amctl shell CMD [args...]" >&2; return 2; }
+    amctl_log shell "shell $*"
+    sh_exec "$AMCTL_MARKER_WAIT" "$@" || return 1
+    printf '%s\n' "$SESSION_OUT"
+}
+
+cmd_pm() {
+    need_full "pm" || return $?
+    need_session "pm" || return $?
+    local sub="${1:-}"
+    case "$sub" in
+        list|install|uninstall|clear|grant|revoke|disable|enable|path|dump|reset-permissions) ;;
+        *) echo "uso: amctl pm {list|install|uninstall|clear|grant|revoke|disable|enable|path|dump|reset-permissions} ..." >&2; return 2 ;;
+    esac
+    local a
+    for a in "$@"; do
+        [[ "$a" == -* || "$a" == +* ]] && continue
+        [[ "$a" =~ $AMCTL_PKG_RE ]] && continue
+        [[ "$a" == /sdcard/* || "$a" == *.apk ]] && continue
+        [[ "$a" =~ ^[a-zA-Z0-9_.:@%+/=-]+$ ]] && continue
+        echo "amctl pm: argumento no permitido: '$a'" >&2
+        return 2
+    done
+    amctl_log pm "pm $*"
+    guard_action pm || return $?
+    sh_exec "$AMCTL_MARKER_WAIT" pm "$@" || return 1
+    printf '%s\n' "$SESSION_OUT"
+}
+
+cmd_settings() {
+    need_full "settings" || return $?
+    need_session "settings" || return $?
+    local sub="${1:-}" ns="${2:-}"
+    case "$sub" in
+        get|put|delete|list) ;;
+        *) echo "uso: amctl settings {get|put|delete|list} {system|secure|global} ..." >&2; return 2 ;;
+    esac
+    case "$ns" in
+        system|secure|global) ;;
+        *) echo "amctl settings: namespace inválido (system|secure|global)" >&2; return 2 ;;
+    esac
+    local a
+    for a in "$@"; do
+        [[ "$a" =~ ^[a-zA-Z0-9_.:@%+/=-]+$ ]] || { echo "amctl settings: argumento no permitido: '$a'" >&2; return 2; }
+    done
+    amctl_log settings "settings $*"
+    guard_action settings || return $?
+    sh_exec "$AMCTL_MARKER_WAIT" settings "$@" || return 1
+    printf '%s\n' "$SESSION_OUT"
+}
+
+cmd_am_force_stop() {
+    need_full "am-force-stop" || return $?
+    need_session "am-force-stop" || return $?
+    [[ "${1:-}" =~ $AMCTL_PKG_RE ]] || { echo "amctl am-force-stop: uso: amctl am-force-stop <paquete>" >&2; return 2; }
+    amctl_log am-force-stop "am force-stop $1"
+    guard_action am-force-stop || return $?
+    sh_exec "$AMCTL_MARKER_WAIT" am force-stop "$1" && echo "Stopped $1"
+}
+
+cmd_screenrecord() {
+    need_full "screenrecord" || return $?
+    need_session "screenrecord" || return $?
+    local time=30 out=/sdcard/Download/amctl-record.mp4
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --time) num_arg "${2:-}" time || return 2; shift 2 || return 2 ;;
+            --out) out="${2:-}"; shift 2 || return 2 ;;
+            *) echo "amctl screenrecord: opción desconocida '$1'" >&2; return 2 ;;
+        esac
+    done
+    (( time < 1 || time > 180 )) && { echo "amctl screenrecord: --time entre 1 y 180 s" >&2; return 2; }
+    [[ "$out" =~ ^/sdcard/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*\.mp4$ ]] || { echo "amctl screenrecord: salida debe ser /sdcard/... .mp4" >&2; return 2; }
+    amctl_log screenrecord "screenrecord --time $time $out"
+    sh_exec "$(( time + 15 ))" screenrecord --time "$time" "$out" && echo "grabado: $out (${time}s)"
+}
+
 # ========================= dispatcher =========================
 case "${1:-help}" in
+    input)      shift; cmd_input "$@" ;;
+    screencap)  cmd_screencap "${2:-}" ;;
+    shell)      shift; cmd_shell "$@" ;;
+    pm)         shift; cmd_pm "$@" ;;
+    settings)   shift; cmd_settings "$@" ;;
+    am-force-stop) cmd_am_force_stop "${2:-}" ;;
+    screenrecord) cmd_screenrecord "$@" ;;
+    guard-off)  cmd_guard_off ;;
+    guard-on)   cmd_guard_on ;;
+    full-on)    cmd_full_on ;;
+    full-off)   cmd_full_off ;;
     session-start) cmd_start ;;
     session-stop)  cmd_stop_session ;;
     status)        cmd_status ;;
