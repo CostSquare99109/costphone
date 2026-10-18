@@ -38,30 +38,69 @@ aapt2 link \
 RJAVADIR=$(find "$OUT/r_java" -name R.java 2>/dev/null | head -1)
 echo "     ✓ R.java → $RJAVADIR"
 
-# 3. Compile Java + R.java
-echo "[3/7] Compile Java sources..."
+# 3. Shizuku: los .aar de libs/ son volúmenes zip y, sin Gradle, no hay quien
+#    los resuelva por nosotros; y la interfaz del UserService es AIDL, que
+#    javac no compila. Las dos cosas se hacen aquí a mano.
+echo "[3/7] Shizuku (AAR → classpath, AIDL → Java)..."
+rm -rf "$OUT/libs" "$OUT/aidl_java"
+mkdir -p "$OUT/libs" "$OUT/aidl_java"
+shopt -s nullglob
+for aar in "$PROJ"/libs/*.aar; do
+    name=$(basename "$aar" .aar)
+    mkdir -p "$OUT/aar/$name"
+    unzip -o -q "$aar" classes.jar -d "$OUT/aar/$name"
+    cp "$OUT/aar/$name/classes.jar" "$OUT/libs/$name.jar"
+    echo "     ✓ libs/$name.jar"
+done
+shopt -u nullglob
+LIBJARS=($(find "$OUT/libs" -name '*.jar' | sort))
+if [[ ${#LIBJARS[@]} -gt 0 ]]; then
+    LIBCP=$(find "$OUT/libs" -name '*.jar' | paste -sd:)
+    FULLCP="$ANDROID_JAR:$LIBCP"
+else
+    FULLCP="$ANDROID_JAR"   # build sin Shizuku, igual que siempre
+fi
+
+AIDLFILES=()
+if [[ -d "$PROJ/src/aidl" ]]; then
+    AIDLFILES=($(find "$PROJ/src/aidl" -name '*.aidl' | sort))
+fi
+if [[ ${#AIDLFILES[@]} -gt 0 ]]; then
+    [[ -x "$SDK_BT/aidl" ]] || {
+        echo "✗ aidl no encontrado en $SDK_BT (hace falta para el UserService de Shizuku)"
+        exit 1
+    }
+    for f in "${AIDLFILES[@]}"; do
+        "$SDK_BT/aidl" -I"$PROJ/src/aidl" -o"$OUT/aidl_java" "$f"
+    done
+    echo "     ✓ AIDL → $OUT/aidl_java"
+fi
+AIDLJAVA=($(find "$OUT/aidl_java" -name '*.java' 2>/dev/null | sort))
+
+# 4. Compile Java + R.java
+echo "[4/7] Compile Java sources..."
 mkdir -p "$OUT/classes"
 SRCS=($(find "$PROJ" -maxdepth 2 -name '*.java' | sort))
 javac -encoding UTF-8 \
     -source 1.8 -target 1.8 \
     -bootclasspath "$ANDROID_JAR" \
     -d "$OUT/classes" \
-    -classpath "$ANDROID_JAR" \
-    "${SRCS[@]}" "${RJAVADIR}" 2>&1 | tail -30
+    -classpath "$FULLCP" \
+    "${SRCS[@]}" "${RJAVADIR}" ${AIDLJAVA[@]+"${AIDLJAVA[@]}"} 2>&1 | tail -30
 echo "     ✓ compiled classes"
 find "$OUT/classes" -name '*.class' | wc -l | xargs echo "     classes:"
 
-# 4. Convert → classes.dex
-echo "[4/7] Create DEX (d8)..."
+# 5. Convert → classes.dex
+echo "[5/7] Create DEX (d8)..."
 mkdir -p "$OUT/dex"
 $D8 --output "$OUT/dex" \
     --lib "$ANDROID_JAR" \
     --min-api 24 \
-    $(find "$OUT/classes" -name '*.class') 2>&1 | tail -5
+    $(find "$OUT/classes" -name '*.class') ${LIBJARS[@]+"${LIBJARS[@]}"} 2>&1 | tail -5
 echo "     ✓ $OUT/dex/classes.dex"
 
-# 5. Embed classes.dex into base.apk
-echo "[5/7] Embed classes.dex into APK..."
+# 6. Embed classes.dex into base.apk
+echo "[6/7] Embed classes.dex into APK..."
 cp "$OUT/base.apk" "$OUT/unsigned.apk"
 # Use zip to add the dex (base.apk already has resources)
 cd "$OUT/dex"
@@ -69,8 +108,8 @@ zip -j "$OUT/unsigned.apk" classes.dex 2>&1 | tail -3
 cd "$PROJ"
 echo "     ✓ unsigned.apk (resources + dex)"
 
-# 6. Sign (zipalign skipped – SDK binary isn't aarch64-compatible here)
-echo "[6/7] Sign APK..."
+# 7. Sign (zipalign skipped – SDK binary isn't aarch64-compatible here)
+echo "[7/7] Sign APK..."
 if [[ ! -f "$KEYSTORE" ]]; then
     mkdir -p "$(dirname "$KEYSTORE")"
     keytool -genkeypair -v \

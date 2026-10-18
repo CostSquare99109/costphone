@@ -179,6 +179,10 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         filter.addAction(ACTION_DISPLAY);
         filter.addAction(ACTION_DISPLAY_BACK);
         registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+        // Calienta Shizuku: si ya tiene permiso, deja el UserService enlazado
+        // para que el primer comando vaya por shell y no por el arranque lento
+        // de accessibility. Si no está, no pasa nada.
+        ShizukuManager.get();
         Log.i(TAG, "AccessibilityService connected – ready");
     }
 
@@ -194,6 +198,8 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         if (receiver != null) {
             try { unregisterReceiver(receiver); } catch (Exception e) { }
         }
+        // No dejamos el UserService (ni su hilo) colgando.
+        ShizukuManager.release();
         sInstance = null;
     }
 
@@ -216,7 +222,8 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 int x = intent.getIntExtra("x", -1);
                 int y = intent.getIntExtra("y", -1);
                 if (x < 0 || y < 0) return;
-                run(makeTap(x, y, 80L, disp(intent)), "tap");
+                if (!ShizukuManager.runShell(disp(intent), "input tap " + x + " " + y))
+                    run(makeTap(x, y, 80L, disp(intent)), "tap");
                 break;
             }
             case ACTION_LONG_PRESS: {
@@ -224,7 +231,9 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 int y = intent.getIntExtra("y", -1);
                 long dur = intent.getLongExtra("duration", 500);
                 if (x < 0 || y < 0) return;
-                run(makeTap(x, y, dur, disp(intent)), "longpress");
+                if (!ShizukuManager.runShell(disp(intent),
+                        "input swipe " + x + " " + y + " " + x + " " + y + " " + dur))
+                    run(makeTap(x, y, dur, disp(intent)), "longpress");
                 break;
             }
             case ACTION_SWIPE: {
@@ -234,31 +243,40 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 int y2 = intent.getIntExtra("y2", -1);
                 long dur = intent.getLongExtra("duration", 300);
                 if (x1 < 0 || x2 < 0) return;
-                run(makeSwipe(x1, y1, x2, y2, dur, disp(intent)), "swipe");
+                if (!ShizukuManager.runShell(disp(intent),
+                        "input swipe " + x1 + " " + y1 + " " + x2 + " " + y2 + " " + dur))
+                    run(makeSwipe(x1, y1, x2, y2, dur, disp(intent)), "swipe");
                 break;
             }
             case ACTION_SCROLL_UP: {
                 android.util.DisplayMetrics dm = metricsOf(disp(intent));
                 int x = intent.getIntExtra("x", dm.widthPixels / 2);
                 int y = intent.getIntExtra("y", (int)(dm.heightPixels * 0.5f));
-                run(makeScroll(x, y, -0.4f, disp(intent)), "scrollUp");
+                if (!ShizukuManager.runShell(disp(intent),
+                        "input swipe " + x + " " + y + " " + x + " " + (y + (int)(dm.heightPixels * -0.4f)) + " 200"))
+                    run(makeScroll(x, y, -0.4f, disp(intent)), "scrollUp");
                 break;
             }
             case ACTION_SCROLL_DOWN: {
                 android.util.DisplayMetrics dm = metricsOf(disp(intent));
                 int x = intent.getIntExtra("x", dm.widthPixels / 2);
                 int y = intent.getIntExtra("y", (int)(dm.heightPixels * 0.5f));
-                run(makeScroll(x, y, 0.4f, disp(intent)), "scrollDown");
+                if (!ShizukuManager.runShell(disp(intent),
+                        "input swipe " + x + " " + y + " " + x + " " + (y + (int)(dm.heightPixels * 0.4f)) + " 200"))
+                    run(makeScroll(x, y, 0.4f, disp(intent)), "scrollDown");
                 break;
             }
             case ACTION_BACK:
-                performGlobalAction(GLOBAL_ACTION_BACK);
+                if (!ShizukuManager.runShell(disp(intent), "input keyevent 4"))
+                    performGlobalAction(GLOBAL_ACTION_BACK);
                 break;
             case ACTION_HOME:
-                performGlobalAction(GLOBAL_ACTION_HOME);
+                if (!ShizukuManager.runShell(disp(intent), "input keyevent 3"))
+                    performGlobalAction(GLOBAL_ACTION_HOME);
                 break;
             case ACTION_RECENTS:
-                performGlobalAction(GLOBAL_ACTION_RECENTS);
+                if (!ShizukuManager.runShell(disp(intent), "input keyevent 187"))
+                    performGlobalAction(GLOBAL_ACTION_RECENTS);
                 break;
             case ACTION_TYPE: {
                 String text = intent.getStringExtra("text");

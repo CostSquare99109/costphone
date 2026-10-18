@@ -13,6 +13,9 @@
          la pantalla secundaria. -->
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"/>
 
+    <!-- Shizuku: para consultarle al gestor y arrancar su servicio. -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23"/>
+
     <supports-screens
         android:smallScreens="true"
         android:normalScreens="true"
@@ -54,6 +57,22 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config"/>
         </service>
+
+        <!-- Shizuku: por este provider llega el binder del gestor.
+             La autoridad va literal (com.accessdroid.termux.shizuku) en vez de
+             ${applicationId}.shizuku porque este proyecto no usa el merger de
+             manifest de Gradle: aapt2 link no expande ese placeholder. -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="com.accessdroid.termux.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <meta-data
+            android:name="moe.shizuku.client.V3_SUPPORT"
+            android:value="true" />
 
     </application>
 </manifest>

@@ -30,11 +30,25 @@ public class SettingsActivity extends Activity {
     private static final int ACCENT_BLUE  = 0xFF0A66E0;
     private static final int ACCENT_GREEN = 0xFF34C759;
     private static final int ACCENT_RED   = 0xFFFF453A;
+    private static final int ACCENT_AMBER = 0xFFFFCC00;
     private static final int TEXT_MAIN    = 0xFFF2F5FA;
     private static final int TEXT_DIM     = 0xFF8B97AD;
 
     private View statusDot;
     private TextView tvStatus;
+
+    private View shizukuDot;
+    private TextView tvShizuku;
+    private Button btnShizuku;
+
+    private static final int REQ_SHIZUKU_PERMISSION = 41;
+
+    private final rikka.shizuku.Shizuku.OnRequestPermissionResultListener shizukuPermListener =
+            new rikka.shizuku.Shizuku.OnRequestPermissionResultListener() {
+                @Override public void onRequestPermissionResult(int requestCode, int grantResult) {
+                    if (requestCode == REQ_SHIZUKU_PERMISSION) refreshShizuku();
+                }
+            };
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -128,6 +142,9 @@ public class SettingsActivity extends Activity {
 
         root.addView(card, lpMATCH(34));
 
+        // ── Tarjeta de Shizuku (opcional) ──
+        root.addView(shizukuCard(), lpMATCH(14));
+
         // ── Pie ──
         TextView tip = new TextView(this);
         tip.setText("Consejo: si MIUI lo desactiva solo, vuelve aquí y reactívalo.");
@@ -144,11 +161,24 @@ public class SettingsActivity extends Activity {
         root.addView(ver, lpWRAP(0));
 
         setContentView(scroll);
+
+        // El resultado del permiso vuelve por aquí, no por onActivityResult.
+        try {
+            rikka.shizuku.Shizuku.addRequestPermissionResultListener(shizukuPermListener);
+        } catch (Throwable ignored) { }
+    }
+
+    @Override protected void onDestroy() {
+        try {
+            rikka.shizuku.Shizuku.removeRequestPermissionResultListener(shizukuPermListener);
+        } catch (Throwable ignored) { }
+        super.onDestroy();
     }
 
     @Override protected void onResume() {
         super.onResume();
         refreshStatus();
+        refreshShizuku();
     }
 
     private void refreshStatus() {
@@ -169,6 +199,100 @@ public class SettingsActivity extends Activity {
             if (id != null && id.contains(getPackageName())) return true;
         }
         return false;
+    }
+
+    // ── Tarjeta de Shizuku ──
+    private View shizukuCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(rounded(BG_CARD, 24, 0));
+        card.setPadding(dp(22), dp(24), dp(22), dp(24));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        shizukuDot = new View(this);
+        row.addView(shizukuDot, lp(dp(14), dp(14), 0));
+
+        tvShizuku = new TextView(this);
+        tvShizuku.setTextSize(17);
+        tvShizuku.setTextColor(TEXT_MAIN);
+        tvShizuku.setTypeface(Typeface.DEFAULT_BOLD);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        tlp.leftMargin = dp(12);
+        row.addView(tvShizuku, tlp);
+        card.addView(row);
+
+        TextView desc = new TextView(this);
+        desc.setText("Opcional. Con Shizuku, CostPhone hace toques y teclas con "
+                + "permisos de shell en vez de con el servicio de accesibilidad: va más "
+                + "rápido y no se cancela si pierdes el foco. Si no lo usas, todo sigue "
+                + "funcionando exactamente igual.");
+        desc.setTextSize(14);
+        desc.setTextColor(TEXT_DIM);
+        desc.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        dlp.topMargin = dp(16);
+        card.addView(desc, dlp);
+
+        btnShizuku = new Button(this);
+        btnShizuku.setAllCaps(false);
+        btnShizuku.setTextSize(16);
+        btnShizuku.setTextColor(0xFFFFFFFF);
+        btnShizuku.setTypeface(Typeface.DEFAULT_BOLD);
+        btnShizuku.setBackground(rounded(ACCENT_BLUE, 16, 0));
+        btnShizuku.setPadding(dp(18), dp(14), dp(18), dp(14));
+        btnShizuku.setStateListAnimator(null);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(22);
+        card.addView(btnShizuku, blp);
+
+        return card;
+    }
+
+    private void refreshShizuku() {
+        switch (ShizukuManager.state()) {
+            case ShizukuManager.READY:
+                shizukuDot.setBackground(rounded(ACCENT_GREEN, 999, 0));
+                tvShizuku.setText("Shizuku activo");
+                tvShizuku.setTextColor(ACCENT_GREEN);
+                btnShizuku.setVisibility(View.GONE);
+                break;
+
+            case ShizukuManager.NO_PERMISSION:
+                shizukuDot.setBackground(rounded(ACCENT_AMBER, 999, 0));
+                tvShizuku.setText("Shizuku sin permiso");
+                tvShizuku.setTextColor(ACCENT_AMBER);
+                btnShizuku.setVisibility(View.VISIBLE);
+                btnShizuku.setText("Pedir permiso");
+                btnShizuku.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) {
+                        ShizukuManager.requestPermission(REQ_SHIZUKU_PERMISSION);
+                    }
+                });
+                break;
+
+            default:
+                shizukuDot.setBackground(rounded(ACCENT_RED, 999, 0));
+                tvShizuku.setText("Shizuku no disponible");
+                tvShizuku.setTextColor(TEXT_DIM);
+                btnShizuku.setVisibility(View.VISIBLE);
+                btnShizuku.setText("Cómo instalarlo");
+                btnShizuku.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) {
+                        startActivity(new Intent(Intent.ACTION_VIEW,
+                                android.net.Uri.parse("https://shizuku.rikka.app/download/")));
+                    }
+                });
+                break;
+        }
     }
 
     // ── Utilidades de UI ──
