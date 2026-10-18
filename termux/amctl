@@ -15,6 +15,9 @@
 #             list / find / stop / info / perms / grant / revoke / clear.
 #
 # Usage: amctl <command> [args...]
+#   session-start            Abre la sesión rish persistente (FIFO) — solo tú
+#   session-stop             Cierra la sesión rish (rish + tail + FIFO)
+#   status                   Backend activo + si la sesión responde
 #   list     [query]            List 3rd-party apps (socket only)
 #   find     <name>             Search apps by label (socket only)
 #   launch   <app|pkg>          Launch an app (use package name without socket)
@@ -79,10 +82,162 @@ need_socket() {
     fi
 }
 
+# ---- persistent rish session: 'tail -f <fifo> | rish > out' ----
+# Opened ONLY by 'amctl session-start'. tail reads the FIFO and pipes every
+# command into rish (which reads stdin); rish's stdout is the out file.
+AMCTL_DIR="$HOME/.amctl"
+AMCTL_FIFO="$AMCTL_DIR/in"
+AMCTL_OUT="$AMCTL_DIR/out"
+AMCTL_PID="$AMCTL_DIR/rish.pid"
+AMCTL_KEEP_PID="$AMCTL_DIR/tail.pid"
+AMCTL_MARKER_WAIT="${AMCTL_MARKER_WAIT:-6}"   # s to wait for the marker
+[[ "${AMCTL_MARKER_WAIT%%.*}" =~ ^[0-9]+$ ]] && (( ${AMCTL_MARKER_WAIT%%.*} >= 1 )) || AMCTL_MARKER_WAIT=6
+SESSION_START_WAIT="${SESSION_START_WAIT:-10}"   # s for the first marker
+[[ "${SESSION_START_WAIT%%.*}" =~ ^[0-9]+$ ]] && (( ${SESSION_START_WAIT%%.*} >= 1 )) || SESSION_START_WAIT=10
+SESSION_MS=0
+
+# Ownership (so a recycled pid is never killed):
+#   rish : holds the out file as stdout (fd 1)
+#   tail : 'tail -f' reopens its file on EOF, so it keeps NO fd on the FIFO ->
+#          identified by its command line instead
+owns_fd() {
+    local l
+    l=$(readlink "/proc/$1/fd/$2" 2>/dev/null) || return 1
+    [[ "$l" == "$3" ]]
+}
+
+session_owner_rish() {
+    [[ -n "${1:-}" ]] || return 1
+    owns_fd "$1" 1 "$AMCTL_OUT"
+}
+
+session_owner_tail() {
+    local c
+    [[ -n "${1:-}" ]] || return 1
+    c=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
+    [[ "$c" == *"tail"* && "$c" == *"$AMCTL_FIFO"* ]]
+}
+
+live_pid() {
+    local f="$1" p
+    [[ -f "$f" ]] || return 1
+    p=$(cat "$f" 2>/dev/null) || return 1
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    printf '%s' "$p"
+}
+
+session_rish_pid() { live_pid "$AMCTL_PID"; }
+session_tail_pid() { live_pid "$AMCTL_KEEP_PID"; }
+
+# both halves of the pipeline must be up: without tail no command reaches rish
+session_alive() {
+    local r t
+    r=$(session_rish_pid) || return 1
+    t=$(session_tail_pid) || return 1
+    [[ -p "$AMCTL_FIFO" ]] || return 1
+    session_owner_rish "$r" || return 1
+    return 0
+}
+
+# leftovers of a session that died: still warns/cleans instead of going silent
+session_dirty()   { [[ -e "$AMCTL_FIFO" || -f "$AMCTL_PID" || -f "$AMCTL_KEEP_PID" ]]; }
+
+# ms without forking date (/proc/uptime is not readable on Android)
+NOW_MS=0
+now_ms() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        NOW_MS=$(( ${EPOCHREALTIME/./} / 1000 ))
+    else
+        NOW_MS=$(( $(date +%s%N) / 1000000 ))
+    fi
+}
+
+# one unique random marker per command (never a fixed one)
+new_marker() {
+    local r
+    r=$(od -An -N6 -tx1 /dev/urandom 2>/dev/null | tr -dc 'a-f0-9')
+    printf '__amctl_%s_%s__' "$$" "${r:-0}"
+}
+
+# POSIX single-quoting for the remote shell (args are never re-parsed)
+shquote() {
+    local s="${1//\'/\'\\\'\'}"
+    printf "'%s'" "$s"
+}
+
+# run a command in the session and wait for ITS marker.
+# rc 0 ok | 2 rish died / "Server is not running" / "Request timeout" | 3 no answer
+session_run() {
+    local -a argv=( "$@" )
+    local marker line off chunk a pid deadline
+    marker=$(new_marker)
+    line=''
+    for a in "${argv[@]}"; do line+=" $(shquote "$a")"; done
+    line+=" ; echo $(shquote "$marker")"
+    pid=$(session_rish_pid) || return 2
+    [[ -p "$AMCTL_FIFO" && -f "$AMCTL_OUT" ]] || return 2
+    off=$(wc -c < "$AMCTL_OUT" 2>/dev/null) || off=0
+    off=${off// /}
+    timeout 3 bash -c 'printf "%s\n" "$1" > "$2"' _ "$line" "$AMCTL_FIFO" 2>/dev/null || return 3
+    now_ms
+    deadline=$(( NOW_MS + ${AMCTL_MARKER_WAIT%%.*} * 1000 ))
+    while :; do
+        chunk=$(tail -c "+$((off + 1))" "$AMCTL_OUT" 2>/dev/null)
+        [[ "$chunk" == *"$marker"* ]] && return 0
+        case "$chunk" in
+            *"Server is not running"*|*"Request timeout"*) return 2 ;;
+        esac
+        kill -0 "$pid" 2>/dev/null || return 2
+        now_ms
+        (( NOW_MS >= deadline )) && break
+        sleep 0.05
+    done
+    return 3
+}
+
+# warn once and retire a broken session: never retried in a loop
+session_drop() {
+    session_retire
+    echo "amctl: sesión rish no usable ($1) — cae a 'am' clásico; 'amctl session-start' para reabrirla." >&2
+}
+
+# kill tail first (rish then sees EOF and exits), then rish; clean FIFO/pidfiles
+session_retire() {
+    local p
+    if p=$(session_tail_pid); then session_owner_tail "$p" && kill "$p" 2>/dev/null; fi
+    if p=$(session_rish_pid); then session_owner_rish "$p" && kill "$p" 2>/dev/null; fi
+    rm -f "$AMCTL_FIFO" "$AMCTL_PID" "$AMCTL_KEEP_PID" 2>/dev/null
+    return 0
+}
+
+session_probe() {
+    local w="${1:-$AMCTL_MARKER_WAIT}" saved="$AMCTL_MARKER_WAIT" t0 t1 rc=0
+    AMCTL_MARKER_WAIT="$w"
+    t0=$(date +%s%N)
+    session_run true || rc=$?
+    t1=$(date +%s%N)
+    AMCTL_MARKER_WAIT="$saved"
+    SESSION_MS=$(( (t1 - t0) / 1000000 ))
+    return "$rc"
+}
+
 # ---- send a raw broadcast to AccessDroid (always carries the secret) ----
+# session first (if the user started one), classic am otherwise
 bc() {
     # $1 = action, rest are --es/--ei/--el extras
     local action="$1"; shift
+    if session_alive; then
+        local rc=0
+        session_run am broadcast -p "$PKG" -a "$action" --es secret "$SECRET" "$@" || rc=$?
+        [[ $rc == 0 ]] && return 0
+        case "$rc" in
+            2) session_drop "rish: Server is not running / Request timeout / rish muerto" ;;
+            *) session_drop "sin marcador en ${AMCTL_MARKER_WAIT}s" ;;
+        esac
+    elif session_dirty; then
+        session_drop "rish no está corriendo"
+    fi
     tam broadcast -p "$PKG" -a "$action" --es secret "$SECRET" "$@" >/dev/null 2>&1
 }
 
@@ -151,6 +306,74 @@ resolve_pkg() {
 }
 
 # ========================= subcommands =========================
+
+# session lifecycle: only the user opens/closes it, never a command
+cmd_start() {
+    command -v rish >/dev/null 2>&1 || { echo "amctl session-start: rish no está instalado (necesita Shizuku)" >&2; return 127; }
+    if session_alive; then echo "sesión rish ya activa (rish $(session_rish_pid), tail $(session_tail_pid))"; return 0; fi
+    session_retire
+    mkdir -p "$AMCTL_DIR" || return 1
+    chmod 700 "$AMCTL_DIR"
+    mkfifo -m 600 "$AMCTL_FIFO" || { echo "amctl session-start: no pude crear $AMCTL_FIFO" >&2; return 1; }
+    chmod 600 "$AMCTL_FIFO"
+    : > "$AMCTL_OUT" 2>/dev/null; chmod 600 "$AMCTL_OUT" 2>/dev/null
+    export RISH_APPLICATION_ID=com.termux
+    # verified working form: tail -f <fifo> | rish > out. The wrapper stores both pids.
+    nohup bash -c '{ tail -f "$1" & printf "%s\n" "$!" > "$3"; } | rish > "$2" 2>&1 & RP=$!; printf "%s\n" "$RP" > "$4"; wait' \
+        _ "$AMCTL_FIFO" "$AMCTL_OUT" "$AMCTL_KEEP_PID" "$AMCTL_PID" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    local i=0
+    while (( i < 40 )); do
+        [[ -s "$AMCTL_KEEP_PID" && -s "$AMCTL_PID" ]] && break
+        sleep 0.05; i=$(( i + 1 ))
+    done
+    if session_probe "$SESSION_START_WAIT"; then
+        echo "sesión rish activa (rish $(session_rish_pid), tail $(session_tail_pid), responde en ${SESSION_MS} ms)"
+        echo "backend: broadcasts por la sesión persistente — 'amctl session-stop' la cierra"
+        return 0
+    fi
+    session_retire
+    echo "amctl session-start: la sesión rish NO respondió en ${SESSION_START_WAIT}s — sesión cerrada." >&2
+    echo "  · ¿Shizuku está abierto y su servidor arrancado?" >&2
+    echo "  · ¿rish está instalado? (command -v rish)" >&2
+    echo "  · salida de la sesión: $AMCTL_OUT" >&2
+    return 1
+}
+
+cmd_stop_session() {
+    local stopped=0 p
+    if p=$(session_tail_pid); then session_owner_tail "$p" && { kill "$p" 2>/dev/null && stopped=1; }; fi
+    if p=$(session_rish_pid); then session_owner_rish "$p" && { kill "$p" 2>/dev/null && stopped=1; }; fi
+    rm -f "$AMCTL_FIFO" "$AMCTL_PID" "$AMCTL_KEEP_PID" 2>/dev/null
+    if [[ $stopped == 1 ]]; then
+        echo "sesión rish detenida (rish + tail limpiados)"
+    else
+        echo "no había ninguna sesión rish activa"
+    fi
+}
+
+cmd_status() {
+    local am="am (clásico)" backend probe
+    [[ "$TRANSPORT" == "socket" ]] && am="termux-am (socket)"
+    backend="$am"; probe="-"
+    local sess="inactiva"
+    if session_alive; then
+        if session_probe; then
+            sess="activa (rish pid $(session_rish_pid))"
+            backend="rish (sesión persistente)"
+            probe="responde en ${SESSION_MS} ms"
+        else
+            sess="activa pero sin respuesta"
+            probe="SIN RESPUESTA — sesión cerrada"
+            session_retire
+        fi
+    fi
+    echo "transporte AM : $am"
+    echo "sesión rish   : $sess"
+    echo "backend activo: $backend"
+    echo "prueba        : $probe"
+    echo "salida sesión : $AMCTL_OUT"
+}
 
 cmd_list() {
     need_socket list || return $?
@@ -328,6 +551,9 @@ cmd_float() {
 
 # ========================= dispatcher =========================
 case "${1:-help}" in
+    session-start) cmd_start ;;
+    session-stop)  cmd_stop_session ;;
+    status)        cmd_status ;;
     list)      cmd_list "${2:-}" ;;
     find)      cmd_find "${2:-}" ;;
     launch)    cmd_launch "${2:-}" ;;
