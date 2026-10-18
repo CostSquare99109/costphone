@@ -2,3 +2,10 @@ app/build/
 *.tmp
 *.log
 __pycache__/
+
+# Keystores / firmas (nunca se suben)
+*.jks
+*.keystore
+
+# Generado por build.sh (aidl)
+app/src/aidl/**/ICostPhoneShell.java

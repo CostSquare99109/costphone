@@ -10,7 +10,17 @@ SDK_BT=$(ls -d ~/android-sdk/build-tools/36.0.0 2>/dev/null || ls -d ~/android-s
 [[ -z "$SDK_BT" ]] && { echo "✗ build-tools not found"; exit 1; }
 D8="bash $SDK_BT/d8"
 APKSIGNER="java -jar $SDK_BT/lib/apksigner.jar"
-KEYSTORE="$HOME/.android/debug.keystore"
+# Keystore: variables de entorno (CI) tienen prioridad. Si no existen, se usa
+# el keystore de debug local y se crea si no está (compatibilidad con el
+# flujo anterior en Termux).
+if [[ -n "${KEYSTORE_PATH:-}" ]]; then
+    KEYSTORE="$KEYSTORE_PATH"
+else
+    KEYSTORE="${KEYSTORE:-$HOME/.android/debug.keystore}"
+fi
+KEY_ALIAS="${KEY_ALIAS:-androiddebugkey}"
+KEYSTORE_PASSWORD="${KEYSTORE_PASSWORD:-android}"
+KEY_PASSWORD="${KEY_PASSWORD:-android}"
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -114,16 +124,17 @@ if [[ ! -f "$KEYSTORE" ]]; then
     mkdir -p "$(dirname "$KEYSTORE")"
     keytool -genkeypair -v \
         -keystore "$KEYSTORE" \
-        -alias androiddebugkey \
+        -alias "$KEY_ALIAS" \
         -keyalg RSA -keysize 2048 \
         -validity 10000 \
-        -storepass android -keypass android \
+        -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" \
         -dname "CN=Android Debug,O=Android,C=US" 2>&1 | tail -3
 fi
 $APKSIGNER sign \
     --ks "$KEYSTORE" \
-    --ks-pass pass:android \
-    --key-pass pass:android \
+    --ks-pass "pass:$KEYSTORE_PASSWORD" \
+    --key-pass "pass:$KEY_PASSWORD" \
+    --ks-key-alias "$KEY_ALIAS" \
     --out "$OUT/CostPhone.apk" \
     "$OUT/unsigned.apk" 2>&1
 echo "     ✓ signed"
