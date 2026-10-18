@@ -76,7 +76,7 @@ public final class ShizukuManager {
     private volatile boolean binding;
     private volatile long bindStartedAt;
     /** true cuando alguien pidió el permiso: si Shizuku vuelve, se vuelve a pedir. */
-    private volatile boolean wantsPermission;
+    private static volatile boolean wantsPermission;
 
     private final ServiceConnection conn = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder service) {

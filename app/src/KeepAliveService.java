@@ -89,8 +89,6 @@ public class KeepAliveService extends Service {
         if (Build.VERSION.SDK_INT < 26) {
             b.setPriority(Notification.PRIORITY_LOW)
              .setDefaults(0);
-        } else {
-            b.setSilent(true);
         }
 
         // Acción explícita: abrir la app sin tener que tocar la notificación.
