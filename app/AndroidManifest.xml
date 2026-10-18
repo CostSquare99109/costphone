@@ -16,6 +16,14 @@
     <!-- Shizuku: para consultarle al gestor y arrancar su servicio. -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23"/>
 
+    <!-- Servicio en primer plano: notificación persistente. Con target SDK 34
+         el tipo specialUse exige también FOREGROUND_SERVICE_SPECIAL_USE, no
+         basta con FOREGROUND_SERVICE. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+    <!-- Android 13+: sin esto la notificación no se muestra. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
     <supports-screens
         android:smallScreens="true"
         android:normalScreens="true"
@@ -56,6 +64,18 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config"/>
+        </service>
+
+        <!-- Mantener a CostPhone con vida: el sistema no cierra un proceso que
+             tiene trabajo en primer plano. Sin esto Android mata la app en
+             cuanto sales de ella, y con ella el servicio de accesibilidad. -->
+        <service
+            android:name=".KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Mantiene el servicio de accesibilidad de CostPhone activo para el control remoto desde Termux"/>
         </service>
 
         <!-- Shizuku: por este provider llega el binder del gestor.

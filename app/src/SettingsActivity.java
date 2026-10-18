@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.content.Intent;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.view.Gravity;
@@ -41,12 +42,21 @@ public class SettingsActivity extends Activity {
     private TextView tvShizuku;
     private Button btnShizuku;
 
+    private TextView tvLog;
+
     private static final int REQ_SHIZUKU_PERMISSION = 41;
 
     private final rikka.shizuku.Shizuku.OnRequestPermissionResultListener shizukuPermListener =
             new rikka.shizuku.Shizuku.OnRequestPermissionResultListener() {
                 @Override public void onRequestPermissionResult(int requestCode, int grantResult) {
                     if (requestCode == REQ_SHIZUKU_PERMISSION) refreshShizuku();
+                }
+            };
+
+    private final ShizukuManager.StateListener shizukuStateListener =
+            new ShizukuManager.StateListener() {
+                @Override public void onStateChanged(int state) {
+                    refreshShizuku();
                 }
             };
 
@@ -145,6 +155,9 @@ public class SettingsActivity extends Activity {
         // ── Tarjeta de Shizuku (opcional) ──
         root.addView(shizukuCard(), lpMATCH(14));
 
+        // ── Tarjeta de batería y registro ──
+        root.addView(batteryAndLogCard(), lpMATCH(14));
+
         // ── Pie ──
         TextView tip = new TextView(this);
         tip.setText("Consejo: si MIUI lo desactiva solo, vuelve aquí y reactívalo.");
@@ -165,12 +178,14 @@ public class SettingsActivity extends Activity {
         // El resultado del permiso vuelve por aquí, no por onActivityResult.
         try {
             rikka.shizuku.Shizuku.addRequestPermissionResultListener(shizukuPermListener);
+            ShizukuManager.registerStateListener(shizukuStateListener);
         } catch (Throwable ignored) { }
     }
 
     @Override protected void onDestroy() {
         try {
             rikka.shizuku.Shizuku.removeRequestPermissionResultListener(shizukuPermListener);
+            ShizukuManager.unregisterStateListener(shizukuStateListener);
         } catch (Throwable ignored) { }
         super.onDestroy();
     }
@@ -199,6 +214,105 @@ public class SettingsActivity extends Activity {
             if (id != null && id.contains(getPackageName())) return true;
         }
         return false;
+    }
+
+    private View batteryAndLogCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(rounded(BG_CARD, 24, 0));
+        card.setPadding(dp(22), dp(24), dp(22), dp(24));
+
+        TextView head = new TextView(this);
+        head.setText("Batería y registro");
+        head.setTextSize(17);
+        head.setTextColor(TEXT_MAIN);
+        head.setTypeface(Typeface.DEFAULT_BOLD);
+        card.addView(head);
+
+        TextView desc = new TextView(this);
+        desc.setText("En MIUI/HyperOS Android mata a CostPhone en cuanto sales de la "
+                + "app. Para que no se apague solo, exclúyela de la optimización de "
+                + "batería. El registro de abajo es lo que ha pasado con la "
+                + "conexión de Shizuku y el servicio.");
+        desc.setTextSize(14);
+        desc.setTextColor(TEXT_DIM);
+        desc.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        dlp.topMargin = dp(10);
+        card.addView(desc, dlp);
+
+        Button btnBat = new Button(this);
+        btnBat.setText("Excluir de optimización de batería");
+        btnBat.setAllCaps(false);
+        btnBat.setTextSize(16);
+        btnBat.setTextColor(0xFFFFFFFF);
+        btnBat.setTypeface(Typeface.DEFAULT_BOLD);
+        btnBat.setBackground(rounded(ACCENT_BLUE, 16, 0));
+        btnBat.setPadding(dp(18), dp(14), dp(18), dp(14));
+        btnBat.setStateListAnimator(null);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(14);
+        btnBat.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                try {
+                    Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                    i.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(i);
+                } catch (Throwable t) {
+                    try {
+                        Intent i = new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
+                        startActivity(i);
+                    } catch (Throwable ignored) { }
+                }
+            }
+        });
+        card.addView(btnBat, blp);
+
+        tvLog = new TextView(this);
+        tvLog.setText(logText());
+        tvLog.setTextSize(11);
+        tvLog.setTextColor(0xFF9FD7FF);
+        tvLog.setTypeface(Typeface.MONOSPACE);
+        tvLog.setLineSpacing(dp(2), 1f);
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        llp.topMargin = dp(14);
+        card.addView(tvLog, llp);
+
+        Button btnClear = new Button(this);
+        btnClear.setText("Limpiar registro");
+        btnClear.setAllCaps(false);
+        btnClear.setTextSize(14);
+        btnClear.setTextColor(0xFFFFFFFF);
+        btnClear.setTypeface(Typeface.DEFAULT_BOLD);
+        btnClear.setBackground(rounded(BG_CARD, 16, 0));
+        btnClear.setPadding(dp(18), dp(10), dp(18), dp(10));
+        btnClear.setStateListAnimator(null);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        clp.topMargin = dp(8);
+        btnClear.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                ConnectionLog.clear();
+                tvLog.setText("");
+            }
+        });
+        card.addView(btnClear, clp);
+
+        return card;
+    }
+
+    private String logText() {
+        StringBuilder sb = new StringBuilder();
+        for (String l : ConnectionLog.dump()) sb.append(l).append('\n');
+        if (sb.length() == 0) sb.append("(sin eventos todavía)");
+        return sb.toString();
     }
 
     // ── Tarjeta de Shizuku ──
@@ -288,11 +402,13 @@ public class SettingsActivity extends Activity {
                 btnShizuku.setOnClickListener(new View.OnClickListener() {
                     @Override public void onClick(View v) {
                         startActivity(new Intent(Intent.ACTION_VIEW,
-                                android.net.Uri.parse("https://shizuku.rikka.app/download/")));
+                                Uri.parse("https://shizuku.rikka.app/download/")));
                     }
                 });
                 break;
         }
+        // El panel de registro refleja el cambio al instante.
+        if (tvLog != null) tvLog.setText(logText());
     }
 
     // ── Utilidades de UI ──

@@ -3,12 +3,16 @@ package com.accessdroid.termux;
 import android.content.ComponentName;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.util.Log;
 import android.view.Display;
 
 import com.accessdroid.termux.shell.ICostPhoneShell;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -45,17 +49,34 @@ public final class ShizukuManager {
     /** Margen antes de reintentar un enlace que no llegó a completarse. */
     private static final long BIND_RETRY_MS = 5000L;
 
+    /** Código de petición que usa Shizuku para el permiso. */
+    private static final int REQ_PERMISSION = 41;
+    /** Intentos de ejecución por comando antes de darlo por fallido. */
+    private static final int MAX_EXEC_ATTEMPTS = 3;
+    /** Pausa entre intentos. */
+    private static final long EXEC_RETRY_DELAY_MS = 200L;
+    /** Si un comando de shell no vuelve en esto, se avisa (no se mata). */
+    private static final long EXEC_TIMEOUT_MS = 30000L;
+
     private static ShizukuManager sInstance;
+
+    /** A quién avisar cuando cambia el estado: el panel lo escucha. */
+    public interface StateListener { void onStateChanged(int state); }
+
+    private static final List<StateListener> listeners = new ArrayList<>();
 
     private final Shizuku.UserServiceArgs args =
             new Shizuku.UserServiceArgs(SHELL_SERVICE).daemon(false);
 
     // Un solo hilo: amctl manda ráfagas de comandos y deben ejecutarse en orden.
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final Handler handler = new Handler(Looper.getMainLooper());
 
     private volatile ICostPhoneShell shell;
     private volatile boolean binding;
     private volatile long bindStartedAt;
+    /** true cuando alguien pidió el permiso: si Shizuku vuelve, se vuelve a pedir. */
+    private volatile boolean wantsPermission;
 
     private final ServiceConnection conn = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder service) {
@@ -75,17 +96,53 @@ public final class ShizukuManager {
             shell = null;
             binding = false;
             Log.w(TAG, "Shizuku: binder muerto (Shizuku se reinició o paró)");
+            notifyStateChanged(UNAVAILABLE);   // cae a accesibilidad, sin ruido
         }
     };
 
     private final Shizuku.OnBinderReceivedListener receivedListener =
             new Shizuku.OnBinderReceivedListener() {
                 @Override public void onBinderReceived() {
-                    // Shizuku arrancó con la app ya abierta: enlazamos si aún no
-                    // lo estábamos. ensureBound() sale solo si ya hay shell.
-                    ensureBound();
+                    // Shizuku arrancó con la app ya abierta.
+                    int st = state();
+                    if (st == NO_PERMISSION && wantsPermission) {
+                        // El usuario ya quiso Shizuku una vez: si vuelve y sigue
+                        // sin permiso, se lo volvemos a pedir en vez de dejar
+                        // el panel en ámbar para siempre.
+                        ConnectionLog.add("Shizuku volvió a estar disponible (sin permiso)");
+                        requestPermission(REQ_PERMISSION);
+                    } else if (st == READY) {
+                        ensureBound();
+                    }
+                    notifyStateChanged(st);
                 }
             };
+
+    /** Suscriptor de cambios de estado (el panel). */
+    public static void registerStateListener(StateListener l) {
+        if (l == null) return;
+        synchronized (listeners) {
+            if (!listeners.contains(l)) listeners.add(l);
+        }
+    }
+
+    public static void unregisterStateListener(StateListener l) {
+        synchronized (listeners) { listeners.remove(l); }
+    }
+
+    /** Avisa en el hilo principal: los listeners tocan la UI. */
+    private static void notifyStateChanged(final int st) {
+        final List<StateListener> copy;
+        synchronized (listeners) { copy = new ArrayList<>(listeners); }
+        if (copy.isEmpty()) return;
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override public void run() {
+                for (StateListener l : copy) {
+                    try { l.onStateChanged(st); } catch (Throwable ignored) { }
+                }
+            }
+        });
+    }
 
     private ShizukuManager() { }
 
@@ -122,6 +179,7 @@ public final class ShizukuManager {
             }
             return READY;
         } catch (Throwable t) {
+            ConnectionLog.add("Shizuku no disponible: " + t);
             return UNAVAILABLE;
         }
     }
@@ -130,9 +188,14 @@ public final class ShizukuManager {
     public static boolean requestPermission(int requestCode) {
         try {
             if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) return true;
+            // Acusamos recibo, para que si Shizuku arranca más tarde y sigue sin
+            // permiso se lo pidamos de nuevo en vez de quedarnos en ámbar.
+            wantsPermission = true;
             Shizuku.requestPermission(requestCode);
+            ConnectionLog.add("Shizuku: permiso pedido");
             return true;
         } catch (Throwable t) {
+            ConnectionLog.add("Shizuku: error al pedir permiso: " + t);
             Log.w(TAG, "requestPermission: " + t);
             return false;
         }
@@ -157,26 +220,63 @@ public final class ShizukuManager {
         final ICostPhoneShell s = shell;
         if (s == null) {
             ensureBound();
+            ConnectionLog.add("Shizuku: no hay binder, usando accesibilidad");
             return false;   // aún no hay binder: accesibilidad, sin esperar
         }
+        final String[] result = { null };
+        final Object gate = new Object();
         try {
             worker.execute(new Runnable() {
                 @Override public void run() {
+                    int attempt = 0;
                     try {
-                        s.exec(cmd);
-                    } catch (Throwable t) {
-                        // El UserService murió entre medias. El siguiente comando
-                        // reintentará enlazar y, si no puede, irá a accesibilidad.
-                        shell = null;
-                        Log.w(TAG, "exec('" + cmd + "') falló: " + t);
+                        while (attempt < MAX_EXEC_ATTEMPTS) {
+                            try {
+                                result[0] = s.exec(cmd);
+                                return;
+                            } catch (Throwable t) {
+                                attempt++;
+                                // El UserService puede haber muerto entre medias.
+                                // Reintentamos enlazar una vez más y probamos de
+                                // nuevo; si no se puede, caemos a accesibilidad.
+                                if (attempt >= MAX_EXEC_ATTEMPTS) {
+                                    shell = null;
+                                    ConnectionLog.add("Shizuku: exec('" + shortCmd(cmd)
+                                            + "') falló tras " + attempt + " intentos");
+                                    Log.w(TAG, "exec('" + cmd + "') falló: " + t);
+                                    return;
+                                }
+                                synchronized (gate) { gate.wait(EXEC_RETRY_DELAY_MS); }
+                            }
+                        }
+                    } catch (InterruptedException ignored) {
+                        ConnectionLog.add("Shizuku: exec interrumpido");
+                    } finally {
+                        synchronized (gate) { gate.notifyAll(); }
                     }
                 }
             });
+            // Esperamos a que vuelva, con tope, para no bloquear el hilo de
+            // broadcast de accesibilidad para siempre.
+            synchronized (gate) {
+                gate.wait(EXEC_TIMEOUT_MS);
+            }
+            if (result[0] == null) {
+                ConnectionLog.add("Shizuku: timeout (" + EXEC_TIMEOUT_MS
+                        + "ms) en '" + shortCmd(cmd) + "', usando accesibilidad");
+                return false;
+            }
             return true;
         } catch (Throwable t) {
+            ConnectionLog.add("Shizuku: no se pudo encolar '" + shortCmd(cmd) + "'");
             Log.w(TAG, "no se pudo encolar '" + cmd + "': " + t);
             return false;
         }
+    }
+
+    private static String shortCmd(String cmd) {
+        if (cmd == null) return "";
+        return cmd.length() > 40 ? cmd.substring(0, 37) + "…" : cmd;
     }
 
     private void ensureBound() {

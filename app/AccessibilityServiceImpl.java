@@ -183,6 +183,12 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         // para que el primer comando vaya por shell y no por el arranque lento
         // de accessibility. Si no está, no pasa nada.
         ShizukuManager.get();
+        // Servicio en primer plano: una notificación persistente es el precio
+        // para que Android no mate el proceso y con él el servicio de
+        // accesibilidad.
+        KeepAliveService.start(this);
+        ConnectionLog.init(this);
+        ConnectionLog.add("Servicio de accesibilidad conectado");
         Log.i(TAG, "AccessibilityService connected – ready");
     }
 
@@ -200,6 +206,8 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         }
         // No dejamos el UserService (ni su hilo) colgando.
         ShizukuManager.release();
+        KeepAliveService.stop(this);
+        ConnectionLog.add("Servicio de accesibilidad desconectado");
         sInstance = null;
     }
 
