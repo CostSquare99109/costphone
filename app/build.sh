@@ -40,11 +40,13 @@ else
     SDK_BT=$(ls -d "$SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -1)
 fi
 [[ -z "$SDK_BT" || ! -d "$SDK_BT" ]] && { echo "✗ build-tools not found in $SDK_ROOT/build-tools/"; exit 1; }
+[[ -x "$SDK_BT/aapt2" ]] || { echo "✗ aapt2 no encontrado en $SDK_BT"; exit 1; }
 
 # Llamadas seguras: no guardamos "bash ..." ni "java -jar ..." en una sola
 # variable, para que las rutas con espacios se traten como argumentos aparte.
 run_d8() { bash "$SDK_BT/d8" "$@"; }
 run_apksigner() { java -jar "$SDK_BT/lib/apksigner.jar" "$@"; }
+run_aapt2() { "$SDK_BT/aapt2" "$@"; }
 # Keystore: variables de entorno (CI) tienen prioridad. Si no existen, se usa
 # el keystore de debug local y se crea si no está (compatibilidad con el
 # flujo anterior en Termux).
@@ -67,12 +69,12 @@ echo "────────────────────────�
 
 # 1. Compile resources → binary resource zip
 echo "[1/7] Compile resources (aapt2 compile)..."
-aapt2 compile --dir res -o "$OUT/res.zip" 2>&1
+run_aapt2 compile --dir res -o "$OUT/res.zip" 2>&1
 echo "     ✓ $OUT/res.zip"
 
 # 2. Link resources → generates R.java AND builds resources into base APK
 echo "[2/7] Link resources + generate R.java (aapt2 link)..."
-aapt2 link \
+run_aapt2 link \
     -o "$OUT/base.apk" \
     --manifest AndroidManifest.xml \
     -I "$ANDROID_JAR" \
@@ -179,7 +181,7 @@ echo ""
 echo "────────────────────────────────────────────"
 run_apksigner verify -v "$OUT/CostPhone.apk" 2>&1 | head -10
 echo "────────────────────────────────────────────"
-aapt2 dump badging "$OUT/CostPhone.apk" 2>&1 | grep -E 'package:|application-label:|sdkVersion:|uses-permission:|launchable-activity:' | head -12
+run_aapt2 dump badging "$OUT/CostPhone.apk" 2>&1 | grep -E 'package:|application-label:|sdkVersion:|uses-permission:|launchable-activity:' | head -12
 echo "────────────────────────────────────────────"
 echo ""
 echo "✅ APK: $OUT/CostPhone.apk"
