@@ -24,10 +24,14 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
       - name: Install platform and build-tools (>= 34)
         run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          set -euo pipefail
+          yes | sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
           echo "ANDROID_HOME=$ANDROID_HOME"
 
       - name: Check keystore secret present
