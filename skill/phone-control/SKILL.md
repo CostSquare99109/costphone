@@ -85,6 +85,56 @@ amctl tapref @pN                 # (o: amctl clickid com.whatsapp:id/send)
 amctl snap                       # verificar que el mensaje salió
 ```
 
+## Pantalla virtual — trabajar aparte sin molestar al usuario (app v1.2+)
+
+Si el usuario dice "hazlo en la otra pantalla" o quiere seguir usando el
+teléfono mientras el agente automatiza: se crea un display secundario y se
+trabaja con `-d N`.
+
+```bash
+amctl display on 1080 1920 320   # crea la pantalla virtual
+amctl displays                   # OBLIGATORIO: el id no se asume, se pregunta
+amctl -d 2 launch com.android.chrome
+amctl -d 2 snap
+amctl -d 2 tapref @p3
+amctl display off
+```
+
+Si se quiere que no estorbe: `amctl display on 1080 1920 320
+gravity_bottom_right` (también `gravity_top_left|top_right|bottom_left`).
+
+Nunca uses `mirror` para trabajar: quita `own_content_only`, el overlay enseña
+la pantalla del usuario y lo que escriba el agente va a ella.
+
+Reglas para no cagarla:
+
+- **El id se pregunta, nunca se supone.** Puede ser 2, 3, 4… según qué haya
+  ya en el dispositivo. `amctl displays` y se usa ese número.
+- **`-d N` es un flag, no un subcomando:** `amctl -d 2 snap` y
+  `amctl snap -d 2` son lo mismo.
+- **Sin `-d`, todo va al display 0** — o sea, la pantalla del usuario. No lo
+  hagas por inercia cuando la tarea es para la pantalla virtual.
+- **`home`, `recents`, `power` y `notifications` son globales: pertenecen al
+  display 0 aunque pongas `-d`.** No los uses como si fueran de la pantalla
+  virtual; `back` sí tiene versión dirigida, y si la app no tiene botón de
+  retroceso visible lo dice por pantalla (`back (display 6): la app no tiene
+  botón de retroceso reconocible…`) — entonces usa `click "Cancelar"` o un
+  `tapref`.
+- **`-d N` solo ve esa pantalla.** El display virtual se crea con
+  `own_content_only` —que CostPhone impone siempre— y si ese display no tiene
+  ventanas propias la respuesta es **"vacío"**, nunca lo que hay en la pantalla
+  del usuario. Si lees "vacío (sin ventanas propias)", el servicio va bien:
+  lánzale algo con `amctl -d N launch <pkg>`.
+- **`openurl -d N` sí abre en esa pantalla** (resuelve la URL a su app), pero
+  si hay varias apps posibles el selector del sistema se abre en la 0 y avisa.
+- **Las refs son por display:** un `@p3` de la pantalla 2 no es válido en la 0.
+  Re-snapshot después de cada cambio, como siempre.
+- **Requiere un `pm grant` previo** (hecho por el usuario, una vez):
+  `WRITE_SECURE_SETTINGS`. Si `amctl display on` responde con `✗ ...`,
+  es que falta: decírselo al usuario, no intentar eludirlo.
+
+Detalle completo y límites: `docs/pantalla-virtual.md` en el repo de CostPhone.
+
 ## Transporte y limitaciones (Termux estable v0.118.3)
 
 - Transporte `am` clásico (socket AM no existe en v0.118.x). No funcionan los

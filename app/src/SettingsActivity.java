@@ -137,7 +137,7 @@ public class SettingsActivity extends Activity {
         root.addView(tip, lpWRAP(24));
 
         TextView ver = new TextView(this);
-        ver.setText("CostPhone · v1.0");
+        ver.setText("CostPhone · v1.2");
         ver.setTextSize(12);
         ver.setTextColor(0xFF546E7A);
         ver.setGravity(Gravity.CENTER);

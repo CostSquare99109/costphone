@@ -13,7 +13,7 @@ Sin root, sin cable USB, sin ADB inalámbrico.
 
 | Pieza | Qué es |
 |---|---|
-| **CostPhone (APK)** | App Android minimalista con un `AccessibilityService`. Recibe comandos y los convierte en toques, gestos, escritura, lectura de pantalla y capturas. (Solo 2 permisos.) |
+| **CostPhone (APK)** | App Android minimalista con un `AccessibilityService`. Recibe comandos y los convierte en toques, gestos, escritura, lectura de pantalla y capturas. (2 permisos + `WRITE_SECURE_SETTINGS` opcional, solo para la pantalla virtual.) |
 | **amctl** | CLI de Termux que controla todo: lanzar apps, snapshot con referencias `@pN`, taps, escribir, capturas PNG. |
 | **Skill `phone-control`** | Guía para OpenCode: enseña a cualquier agente a manejar el teléfono sin conocer los detalles internos. |
 
@@ -95,6 +95,9 @@ amctl see      # captura PNG -> /sdcard/Download/accessdroid-shot.png
 | Atrás / Inicio / Recientes | `amctl back` / `home` / `recents` |
 | Clic por texto | `amctl click "Enviar"` |
 | Clic por resource-id | `amctl clickid com.whatsapp:id/send` |
+| Ver los displays | `amctl displays` |
+| Crear/apagar la pantalla virtual del agente | `amctl display on 1080 1920 320` / `display off` |
+| Todo lo anterior **en la pantalla virtual** | `amctl -d <id> <cualquier comando>` |
 
 Extra v1.1: cuando el teclado o una toolbar flotante están abiertos, sus
 botones entran al snapshot marcados `[ime]` / `[ovl]` / `[sys]` — Enter,
@@ -107,6 +110,47 @@ amctl snap           →  lista interactiva con refs @pN
 amctl tapref @pN     →  toca ese elemento
 amctl snap           →  RE-SNAPSHOT (las refs se invalidan tras cada cambio)
 ```
+
+## Pantalla virtual (v1.2) — el agente en su propio monitor
+
+CostPhone puede crear un **display secundario** dentro del teléfono y dirigir
+allí los comandos, mientras el usuario sigue con normalidad en la pantalla 0:
+
+```sh
+amctl display on 1080 1920 320   # crea la pantalla virtual
+amctl displays                   # → d6 Superposición 1080x1920 320 … (el id no es fijo)
+amctl -d 6 launch com.android.chrome
+amctl -d 6 snap
+amctl -d 6 tapref @p3            # los gestos van dirigidos, la 0 no se toca
+amctl display off
+```
+
+El flag `-d N` vale para todos los comandos (`tap`, `type`, `click`, `see`,
+`launch`, `back`…), los refs `@pN` son por display y la captura se guarda como
+`accessdroid-shot-d<N>.png`.
+
+Dos detalles que no son evidentes:
+
+- El ajuste `overlay_display_devices` **no es JSON**: es `WxH/dpi[,flags]`.
+  CostPhone **impone** `own_content_only` siempre, porque sin ese flag la
+  pantalla virtual **espeja** la principal y el agente acabaría escribiendo en
+  lo que el usuario está usando. Para verla en espejo a propósito:
+  `amctl display on … mirror` (avisa de que no aisla).
+- Un display recién encendido no tiene ventanas, y ahí Android devuelve la
+  ventana activa *global*: por eso CostPhone devuelve "vacío" en vez de lo que
+  tienes delante en la pantalla 0.
+- Crear el display requiere `WRITE_SECURE_SETTINGS`, que se concede **una sola
+  vez** por ADB y ya no se necesita nunca más:
+
+```sh
+adb shell pm grant com.accessdroid.termux android.permission.WRITE_SECURE_SETTINGS
+```
+
+Sin ese permiso, todo lo demás sigue funcionando; solo `display on/off` dice
+qué comando falta. En `-d N openurl` la URL se resuelve a su app para poder
+dirigirla, porque el selector del sistema siempre sale en la pantalla 0. Detalles, límites (`back`/`home` son globales: pertenecen a
+la pantalla 0) y la bitácora de cómo se descubrió esto:
+**[docs/pantalla-virtual.md](docs/pantalla-virtual.md)**.
 
 ## La skill para agentes
 
@@ -150,8 +194,10 @@ Los íconos se regeneran del logo con `python3 gen-icons.py`
 - Los broadcasts van dirigidos explícitamente al paquete
   (`-p com.accessdroid.termux`), no son difundidos a todas las apps.
 - El servicio solo ejecuta comandos que traen el secreto compartido.
-- La app pide únicamente 2 permisos:
-  `BIND_ACCESSIBILITY_SERVICE` y `QUERY_ALL_PACKAGES`.
+- La app pide 2 permisos siempre (`BIND_ACCESSIBILITY_SERVICE`,
+  `QUERY_ALL_PACKAGES`) y uno opcional (`WRITE_SECURE_SETTINGS`, solo para crear
+  la pantalla virtual). Android no concede los que no sepidan; el opcional
+  arranca **sin** conceder y solo habilita `amctl display on/off`.
 - ⚠️ En esta v1 el secreto es fijo (visible en el APK que distribuyes).
   Protege contra comandos casuales de apps ajenas, no contra una app
   maliciosa que ya conozca el secreto. Si te preocupa, cambia `SECRET` en
@@ -164,5 +210,6 @@ Los íconos se regeneran del logo con `python3 gen-icons.py`
 - **CostPhone** agrega: rebranding + logo, panel premium en español,
   limpieza de permisos/componentes, comandos `snap`/`tapref`/`see` con refs
   estilo agent-browser, verificación anti-datos-viejos, skill para agentes,
-  y fixes varios (screenshot en Android 14/16, servicio tras updates).
+  pantalla virtual dirigida (`amctl -d N`), y fixes varios (screenshot en
+  Android 14/16, servicio tras updates).
 - Licencia: **MIT** — ver [LICENSE](LICENSE).
