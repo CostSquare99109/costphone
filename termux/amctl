@@ -97,6 +97,31 @@ ac() {
     fi
 }
 
+# ---- wait until a file exists with a stable size ----
+# Replaces the fixed sleeps: polls every 0.05s and returns as soon as the file
+# has stopped growing (a partially written file is never returned).
+# $1 = file, $2 = cap in seconds (same maximum wait the fixed sleeps allowed).
+wait_file() {
+    local f="${1:-}" cap="${2:-5}"
+    cap="${cap%%.*}"
+    local max_ms=$(( cap * 1000 )) waited=0 size=-1 stable=0 cur
+    while (( waited < max_ms )); do
+        if [[ -f "$f" ]]; then
+            cur=$(stat -c%s "$f" 2>/dev/null) || cur=-1
+            [[ "$cur" =~ ^[0-9]+$ ]] || cur=-1
+            if (( cur > 0 )) && [[ "$cur" == "$size" ]]; then
+                stable=$(( stable + 1 ))
+                (( stable >= 2 )) && return 0
+            else
+                size="$cur"; stable=0
+            fi
+        fi
+        sleep 0.05
+        waited=$(( waited + 50 ))
+    done
+    return 1
+}
+
 # ---- package resolution (substring match -> unique package) ----
 resolve_pkg() {
     local input="$1"
@@ -193,8 +218,8 @@ cmd_perms()  { need_socket perms || return $?; local pkg; pkg=$(resolve_pkg "$1"
 cmd_grant()  { need_socket grant || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; shift; local perm="$1"; tam pm grant "$pkg" "$perm" 2>/dev/null && echo "Granted $perm to $pkg"; }
 cmd_revoke() { need_socket revoke || return $?; local p; p=$(resolve_pkg "$1") || return $?; shift; local perm; tam pm revoke "${p}" "${1:-}" 2>/dev/null; }
 cmd_clear()  { need_socket clear || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam clear package "$pkg" 2>/dev/null && echo "Cleared $pkg"; }
-cmd_tree()   { local f=/sdcard/Download/accessdroid-tree.txt; rm -f "$f"; bc com.accessdroid.termux.ACTION_GET_UI_TREE; local ok=0; for i in 1 2 3 4 5; do sleep 1; [[ -f "$f" ]] && { ok=1; break; }; done; if [[ $ok == 1 ]]; then cat "$f"; else echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)"; return 1; fi; }
-cmd_snap()   { local f=/sdcard/Download/accessdroid-tree.txt; rm -f "$f"; bc com.accessdroid.termux.ACTION_GET_UI_TREE; local ok=0; for i in 1 2 3 4 5; do sleep 1; [[ -f "$f" ]] && { ok=1; break; }; done; [[ $ok == 1 ]] || { echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2; return 1; }; python3 "$HOME/bin/amctl-snap.py" "$@"; }
+cmd_tree()   { local f=/sdcard/Download/accessdroid-tree.txt; rm -f "$f"; bc com.accessdroid.termux.ACTION_GET_UI_TREE; wait_file "$f" 5 && { cat "$f"; return 0; }; echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)"; return 1; }
+cmd_snap()   { local f=/sdcard/Download/accessdroid-tree.txt; rm -f "$f"; bc com.accessdroid.termux.ACTION_GET_UI_TREE; wait_file "$f" 5 || { echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2; return 1; }; python3 "$HOME/bin/amctl-snap.py" "$@"; }
 
 cmd_tapref() {
     local ref="${1:-}"
@@ -266,7 +291,7 @@ PY
 cmd_click()      { bc com.accessdroid.termux.ACTION_CLICK_TEXT --es text "$1"; }
 cmd_clickid()    { bc com.accessdroid.termux.ACTION_CLICK_ID --es id "$1"; }
 cmd_scrollto()   { bc com.accessdroid.termux.ACTION_SCROLL_TO --es text "$1"; }
-cmd_shot()       { local f="${1:-/sdcard/Download/accessdroid-shot.png}"; local i; rm -f "$f" 2>/dev/null; for i in 1 2 3; do bc com.accessdroid.termux.ACTION_SCREENDUMP; sleep 2; [[ -f "$f" ]] && break; done; if [[ -f "$f" ]]; then echo "PNG: $f ($(stat -c%s "$f") bytes)"; else echo "(no se guardo el PNG)"; if [[ -f /sdcard/Download/accessdroid-shot-error.txt ]]; then echo "error del servicio:"; cat /sdcard/Download/accessdroid-shot-error.txt; fi; fi; }
+cmd_shot()       { local f="${1:-/sdcard/Download/accessdroid-shot.png}"; local i; rm -f "$f" 2>/dev/null; for i in 1 2 3; do bc com.accessdroid.termux.ACTION_SCREENDUMP; wait_file "$f" 2 && break; done; if [[ -f "$f" ]]; then echo "PNG: $f ($(stat -c%s "$f") bytes)"; else echo "(no se guardo el PNG)"; if [[ -f /sdcard/Download/accessdroid-shot-error.txt ]]; then echo "error del servicio:"; cat /sdcard/Download/accessdroid-shot-error.txt; fi; fi; }
 cmd_presskey()   { local k="$1"; local code=0; case "$k" in back) code=4;; home) code=3;; recents) code=187;; *) echo "only back|home|recents supported" >&2; return 1;; esac; bc com.accessdroid.termux.ACTION_PRESS_KEY --ei keyCode "$code"; }
 
 # float <texto>: recents -> tarjeta de la app (por texto) -> long-press -> 'ventanas flotantes'
