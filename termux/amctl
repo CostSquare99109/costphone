@@ -109,6 +109,7 @@ AMCTL_FIFO="$AMCTL_DIR/in"
 AMCTL_OUT="$AMCTL_DIR/out"
 AMCTL_PID="$AMCTL_DIR/rish.pid"
 AMCTL_KEEP_PID="$AMCTL_DIR/tail.pid"
+AMCTL_WRAP_PID="$AMCTL_DIR/wrap.pid"
 AMCTL_MARKER_WAIT="${AMCTL_MARKER_WAIT:-6}"   # s to wait for the marker
 [[ "${AMCTL_MARKER_WAIT%%.*}" =~ ^[0-9]+$ ]] && (( ${AMCTL_MARKER_WAIT%%.*} >= 1 )) || AMCTL_MARKER_WAIT=6
 SESSION_START_WAIT="${SESSION_START_WAIT:-10}"   # s for the first marker
@@ -148,6 +149,7 @@ live_pid() {
 
 session_rish_pid() { live_pid "$AMCTL_PID"; }
 session_tail_pid() { live_pid "$AMCTL_KEEP_PID"; }
+session_wrap_pid() { live_pid "$AMCTL_WRAP_PID"; }
 
 # both halves of the pipeline must be up: without tail no command reaches rish
 session_alive() {
@@ -296,13 +298,48 @@ need_full() {
     return 0
 }
 
-# kill tail first (rish then sees EOF and exits), then rish; clean FIFO/pidfiles
-session_retire() {
-    local p
-    if p=$(session_tail_pid); then session_owner_tail "$p" && kill "$p" 2>/dev/null; fi
-    if p=$(session_rish_pid); then session_owner_rish "$p" && kill "$p" 2>/dev/null; fi
-    rm -f "$AMCTL_FIFO" "$AMCTL_PID" "$AMCTL_KEEP_PID" 2>/dev/null
+session_owner_wrap() {
+    local c
+    [[ -n "${1:-}" ]] || return 1
+    c=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
+    [[ "$c" == *"$AMCTL_FIFO"* ]]
+}
+
+# SIGTERM, wait, then SIGKILL; returns 1 if it is still alive afterwards
+kill_and_wait() {
+    local p="${1:-}" i
+    [[ -n "$p" ]] || return 0
+    kill -0 "$p" 2>/dev/null || return 0
+    kill "$p" 2>/dev/null
+    for (( i = 0; i < 10; i++ )); do
+        kill -0 "$p" 2>/dev/null || return 0
+        sleep 0.05
+    done
+    kill -9 "$p" 2>/dev/null
+    sleep 0.05
+    kill -0 "$p" 2>/dev/null && return 1
     return 0
+}
+
+# kill tail first (rish then sees EOF and exits), then rish, then the wrapper.
+# Returns 1 if anything of ours could not be stopped.
+session_retire() {
+    local p left=0
+    if p=$(session_tail_pid); then
+        session_owner_tail "$p" && kill_and_wait "$p" || left=1
+    fi
+    if p=$(session_rish_pid); then
+        session_owner_rish "$p" && kill_and_wait "$p" || left=1
+    fi
+    if p=$(session_wrap_pid); then
+        session_owner_wrap "$p" && kill_and_wait "$p" || left=1
+    fi
+    # safety net: a leaked 'tail -f ~/.amctl/in' from an older attempt
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -f "$AMCTL_FIFO" 2>/dev/null
+    fi
+    rm -f "$AMCTL_FIFO" "$AMCTL_PID" "$AMCTL_KEEP_PID" "$AMCTL_WRAP_PID" 2>/dev/null
+    [[ $left == 0 ]]
 }
 
 # run an allow-listed remote command through the session
@@ -562,10 +599,11 @@ bc_raw() {
 bc() {
     # $1 = action, rest are --es/--ei/--el extras
     local action="$1"; shift
-    amctl_log broadcast "$action"
+    # logged only when it really goes out; a refusal is logged as DENY alone
     if ! action_exempt "$action" "$@"; then
         guard_action "$action" || return $?
     fi
+    amctl_log broadcast "$action"
     bc_raw "$action" "$@"
 }
 
@@ -651,6 +689,7 @@ cmd_start() {
     # verified working form: tail -f <fifo> | rish > out. The wrapper stores both pids.
     nohup bash -c '{ tail -f "$1" & printf "%s\n" "$!" > "$3"; } | rish > "$2" 2>&1 & RP=$!; printf "%s\n" "$RP" > "$4"; wait' \
         _ "$AMCTL_FIFO" "$AMCTL_OUT" "$AMCTL_KEEP_PID" "$AMCTL_PID" >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$AMCTL_WRAP_PID"
     disown 2>/dev/null || true
     local i=0
     while (( i < 40 )); do
@@ -662,8 +701,12 @@ cmd_start() {
         echo "backend: broadcasts por la sesión persistente — 'amctl session-stop' la cierra"
         return 0
     fi
-    session_retire
-    echo "amctl session-start: la sesión rish NO respondió en ${SESSION_START_WAIT}s — sesión cerrada." >&2
+    if ! session_retire; then
+        echo "amctl session-start: la sesión rish NO respondió en ${SESSION_START_WAIT}s y" >&2
+        echo "  algún proceso sigue vivo: revisa 'ps -A | grep $AMCTL_FIFO'." >&2
+    else
+        echo "amctl session-start: la sesión rish NO respondió en ${SESSION_START_WAIT}s — sesión cerrada." >&2
+    fi
     echo "  · ¿Shizuku está abierto y su servidor arrancado?" >&2
     echo "  · ¿rish está instalado? (command -v rish)" >&2
     echo "  · salida de la sesión: $AMCTL_OUT" >&2
@@ -671,15 +714,18 @@ cmd_start() {
 }
 
 cmd_stop_session() {
-    local stopped=0 p
-    if p=$(session_tail_pid); then session_owner_tail "$p" && { kill "$p" 2>/dev/null && stopped=1; }; fi
-    if p=$(session_rish_pid); then session_owner_rish "$p" && { kill "$p" 2>/dev/null && stopped=1; }; fi
-    rm -f "$AMCTL_FIFO" "$AMCTL_PID" "$AMCTL_KEEP_PID" 2>/dev/null
-    if [[ $stopped == 1 ]]; then
-        echo "sesión rish detenida (rish + tail limpiados)"
+    local had=0
+    [[ -f "$AMCTL_PID" || -f "$AMCTL_KEEP_PID" || -f "$AMCTL_WRAP_PID" ]] && had=1
+    if ! session_retire; then
+        echo "amctl session-stop: algún proceso de la sesión no muere — revisa 'ps -A | grep $AMCTL_FIFO'." >&2
+        return 1
+    fi
+    if [[ $had == 1 ]]; then
+        echo "sesión rish detenida (rish + tail + wrapper limpiados)"
     else
         echo "no había ninguna sesión rish activa"
     fi
+    return 0
 }
 
 cmd_status() {
@@ -859,7 +905,7 @@ PY
 cmd_click()      { bc com.accessdroid.termux.ACTION_CLICK_TEXT --es text "$1"; }
 cmd_clickid()    { bc com.accessdroid.termux.ACTION_CLICK_ID --es id "$1"; }
 cmd_scrollto()   { bc com.accessdroid.termux.ACTION_SCROLL_TO --es text "$1"; }
-cmd_shot()       { local f="${1:-/sdcard/Download/accessdroid-shot.png}"; local i; rm -f "$f" 2>/dev/null; for i in 1 2 3; do bc com.accessdroid.termux.ACTION_SCREENDUMP; wait_file "$f" 2 && break; done; if [[ -f "$f" ]]; then echo "PNG: $f ($(stat -c%s "$f") bytes)"; else echo "(no se guardo el PNG)"; if [[ -f /sdcard/Download/accessdroid-shot-error.txt ]]; then echo "error del servicio:"; cat /sdcard/Download/accessdroid-shot-error.txt; fi; fi; }
+cmd_shot()       { guard_readonly shot || return $?; local f="${1:-/sdcard/Download/accessdroid-shot.png}"; local i; rm -f "$f" 2>/dev/null; for i in 1 2 3; do bc com.accessdroid.termux.ACTION_SCREENDUMP; wait_file "$f" 2 && break; done; if [[ -f "$f" ]]; then echo "PNG: $f ($(stat -c%s "$f") bytes)"; else echo "(no se guardo el PNG)"; if [[ -f /sdcard/Download/accessdroid-shot-error.txt ]]; then echo "error del servicio:"; cat /sdcard/Download/accessdroid-shot-error.txt; fi; fi; }
 cmd_presskey()   { local k="$1"; local code=0; case "$k" in back) code=4;; home) code=3;; recents) code=187;; *) echo "only back|home|recents supported" >&2; return 1;; esac; bc com.accessdroid.termux.ACTION_PRESS_KEY --ei keyCode "$code"; }
 
 # float <texto>: recents -> tarjeta de la app (por texto) -> long-press -> 'ventanas flotantes'
@@ -1090,8 +1136,8 @@ cmd_pm() {
         echo "amctl pm: argumento no permitido: '$a'" >&2
         return 2
     done
-    amctl_log pm "pm $*"
     guard_action pm || return $?
+    amctl_log pm "pm $*"
     sh_exec "$AMCTL_MARKER_WAIT" pm "$@" || return 1
     printf '%s\n' "$SESSION_OUT"
 }
@@ -1112,8 +1158,8 @@ cmd_settings() {
     for a in "$@"; do
         [[ "$a" =~ ^[a-zA-Z0-9_.:@%+/=-]+$ ]] || { echo "amctl settings: argumento no permitido: '$a'" >&2; return 2; }
     done
-    amctl_log settings "settings $*"
     guard_action settings || return $?
+    amctl_log settings "settings $*"
     sh_exec "$AMCTL_MARKER_WAIT" settings "$@" || return 1
     printf '%s\n' "$SESSION_OUT"
 }
@@ -1122,8 +1168,8 @@ cmd_am_force_stop() {
     need_full "am-force-stop" || return $?
     need_session "am-force-stop" || return $?
     [[ "${1:-}" =~ $AMCTL_PKG_RE ]] || { echo "amctl am-force-stop: uso: amctl am-force-stop <paquete>" >&2; return 2; }
-    amctl_log am-force-stop "am force-stop $1"
     guard_action am-force-stop || return $?
+    amctl_log am-force-stop "am force-stop $1"
     sh_exec "$AMCTL_MARKER_WAIT" am force-stop "$1" && echo "Stopped $1"
 }
 
