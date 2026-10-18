@@ -55,6 +55,11 @@ jobs:
           bash build.sh
           ls -la build/CostPhone.apk
 
+      - name: Print APK certificate SHA-256
+        run: |
+          cd app
+          "$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)/apksigner" verify --print-certs build/CostPhone.apk | grep -i 'sha-256' || true
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
