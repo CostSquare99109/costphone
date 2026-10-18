@@ -3,6 +3,8 @@ name: Build CostPhone APK
 on:
   workflow_dispatch:
   push:
+    branches:
+      - mi-cambio
     tags:
       - 'v*'
 
