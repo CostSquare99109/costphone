@@ -29,6 +29,7 @@ jobs:
         with:
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: false
+          packages: platform-tools
 
       - name: Install platform and build-tools (>= 34)
         run: |
