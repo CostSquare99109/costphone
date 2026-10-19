@@ -6,6 +6,14 @@ set -euo pipefail
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$PROJ/build"
 DIAGNOSTIC="$OUT/.build-diagnostic.txt"
+
+# Clean output directory BEFORE diagnostics, as required
+rm -rf "$OUT"
+mkdir -p "$OUT"/classes
+mkdir -p "$OUT"/aidl_java
+mkdir -p "$OUT"/libs
+mkdir -p "$OUT"/aar
+
 SDK_ROOT=""
 ANDROID_JAR=""
 SDK_BT=""
@@ -203,14 +211,15 @@ else
     echo "     (no AIDL files to process)" >> "$DIAGNOSTIC"
 fi
 AIDLJAVA=($(find "$OUT/aidl_java" -name '*.java' 2>/dev/null | sort))
+RJAVA=($(find "$OUT/r_java" -name '*.java' 2>/dev/null | sort))
 
 # Colección explícita de fuentes Java que deben compilarse
 SRCS=(
-    "app/src/ConnectionLog.java"
-    "app/src/KeepAliveService.java"
-    "app/src/SettingsActivity.java"
-    "app/src/ShizukuManager.java"
-    "app/src/ShizukuShellService.java"
+    "src/ConnectionLog.java"
+    "src/KeepAliveService.java"
+    "src/SettingsActivity.java"
+    "src/ShizukuManager.java"
+    "src/ShizukuShellService.java"
 )
 
 # RJAVADIR no usado directamente; las fuentes van como argumentos individuales
@@ -228,7 +237,7 @@ javac_output=$($JAVA_CMD \
     --bootclasspath "$ANDROID_JAR" \
     -d "$OUT/classes" \
     -classpath "$FULLCP" \
-    "${SRCS[@]}" ${AIDLJAVA[@]+"${AIDLJAVA[@]}"} 2>&1)
+    "${SRCS[@]}" ${AIDLJAVA[@]+"${AIDLJAVA[@]}"} ${RJAVA[@]+"${RJAVA[@]}"} 2>&1)
 javac_exit=$?
 set -e
 echo "$javac_output" >> "$DIAGNOSTIC"
@@ -277,7 +286,7 @@ if [[ ! -f "$KEYSTORE" ]]; then
         -dname "CN=Android Debug,O=Android,C=US" 2>>"$DIAGNOSTIC" | tail -3
 fi
 set +e
-SIGN_OUT=$(/data/data/com.termux/files/usr/lib/jvm/java-21-openjdk/bin/java -jar "$SDK_BT/lib/apksigner.jar" sign \
+SIGN_OUT=$(run_apksigner sign \
     --ks "$KEYSTORE" \
     --ks-pass "pass:$KEYSTORE_PASSWORD" \
     --key-pass "pass:$KEY_PASSWORD" \

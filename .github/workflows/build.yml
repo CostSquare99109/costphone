@@ -85,19 +85,25 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           cd app
+          # Initialize exit code
+          BASH_EXIT=0
           # Save build script output and exit code
-          set -euo pipefail
           bash build.sh > build_output.txt 2>&1 || BASH_EXIT=$?
           echo "BASH_EXIT=$BASH_EXIT" >> build_output.txt
-          # Always list the APK status (even if build failed)
-          if [ -f build/CostPhone.apk ]; then
-              echo "APK exists: $(wc -c < build/CostPhone.apk) bytes"
-          else
-              echo "APK not found after build"
-          fi
-          # Always upload the diagnostic output as artifact
+          # Always save diagnostics even on failure
           mkdir -p diag-artifacts
           cp build_output.txt diag-artifacts/build_output.txt
+          # Check APK status after build
+          if [ -f build/CostPhone.apk ] && [ -s build/CostPhone.apk ]; then
+              echo "APK exists and has content: $(wc -c < build/CostPhone.apk) bytes"
+          else
+              echo "APK not found or empty after build"
+              BASH_EXIT=1
+          fi
+          # Propagate error code if build failed
+          if [[ $BASH_EXIT -ne 0 ]]; then
+            exit $BASH_EXIT
+          fi
 
       - name: Diagnostics Summary (if failed)
         if: failure()
@@ -127,6 +133,7 @@ jobs:
         with:
           name: CostPhone
           path: app/build/CostPhone.apk
+          if-no-files-found: error
 
       - name: Upload diagnostic artifact (always)
         uses: actions/upload-artifact@v4
