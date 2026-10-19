@@ -202,21 +202,21 @@ public final class ShizukuManager {
     }
 
     /**
-     * Intenta ejecutar {@code cmd} por shell.
+     * Intenta ejecutar una operación tipada por Shizuku.
      *
-     * @return true si Shizuku se quedó el comando; false si no hay que esperar
+     * @return true si Shizuku ejecutó la operación; false si no hay que esperar
      *         nada y el llamador debe usar accesibilidad.
      */
-    public static boolean runShell(int displayId, String cmd) {
-        // `input` no sabe dirigir un display secundario: en la pantalla virtual
+    public static boolean runShell(int displayId, String action, Object... args) {
+        // Las operaciones de input no saben dirigir un display secundario: en la pantalla virtual
         // (-d N) seguimos con los gestos de accesibilidad, que sí llevan displayId.
         if (displayId != Display.DEFAULT_DISPLAY) return false;
         ShizukuManager m = peek();
         if (m == null) return false;
-        return m.exec(cmd);
+        return m.execTyped(action, args);
     }
 
-    private boolean exec(final String cmd) {
+    private boolean execTyped(final String action, final Object[] args) {
         final ICostPhoneShell s = shell;
         if (s == null) {
             ensureBound();
@@ -232,7 +232,67 @@ public final class ShizukuManager {
                     try {
                         while (attempt < MAX_EXEC_ATTEMPTS) {
                             try {
-                                result[0] = s.exec(cmd);
+                                String resultStr = null;
+                                switch (action) {
+                                    case "input_tap":
+                                        if (args == null || args.length < 3) throw new IllegalArgumentException("input_tap requires 3 args");
+                                        // Validar coordenadas no negativas y duración razonable
+                                        int x = (int) args[0];
+                                        int y = (int) args[1];
+                                        long dur = (long) args[2];
+                                        if (x < 0 || y < 0 || dur < 0 || dur > 8000) {
+                                            throw new IllegalArgumentException("input_tap: invalid coords or duration");
+                                        }
+                                        resultStr = s.inputTap((int) args[0], (int) args[1], (long) args[2]);
+                                        break;
+                                    case "input_swipe":
+                                        if (args == null || args.length < 5) throw new IllegalArgumentException("input_swipe requires 5 args");
+                                        int x1 = (int) args[0];
+                                        int y1 = (int) args[1];
+                                        int x2 = (int) args[2];
+                                        int y2 = (int) args[3];
+                                        long dur = (long) args[4];
+                                        if (x1 < 0 || y1 < 0 || x2 < 0 || y2 < 0 || dur < 0 || dur > 8000) {
+                                            throw new IllegalArgumentException("input_swipe: invalid coords or duration");
+                                        }
+                                        resultStr = s.inputSwipe((int) args[0], (int) args[1], (int) args[2], (int) args[3], (long) args[4]);
+                                        break;
+                                    case "input_keyevent":
+                                        if (args == null || args.length < 1) throw new IllegalArgumentException("input_keyevent requires 1 arg");
+                                        resultStr = s.inputKeyevent((int) args[0]);
+                                        break;
+                                    case "screencap":
+                                        if (args == null || args.length < 1) throw new IllegalArgumentException("screencap requires 1 arg");
+                                        resultStr = s.screencap((String) args[0]);
+                                        break;
+                                    case "am_start":
+                                        if (args == null || args.length < 3) throw new IllegalArgumentException("am_start requires 3 args");
+                                        resultStr = s.amStart((String) args[0], (String) args[1], (String) args[2]);
+                                        break;
+                                    case "global_back":
+                                        resultStr = s.globalActionBack();
+                                        break;
+                                    case "global_home":
+                                        resultStr = s.globalActionHome();
+                                        break;
+                                    case "global_recents":
+                                        resultStr = s.globalActionRecents();
+                                        break;
+                                    case "global_lock":
+                                        resultStr = s.globalActionLockScreen();
+                                        break;
+                                    case "global_screenshot":
+                                        resultStr = s.globalActionScreenshot();
+                                        break;
+                                    case "global_power":
+                                        resultStr = s.globalActionPowerDialog();
+                                        break;
+                                    default:
+                                        resultStr = "error: acción desconocida";
+                                        Log.w(TAG, "Shizuku: acción desconocida: " + action);
+                                        break;
+                                }
+                                result[0] = resultStr;
                                 return;
                             } catch (Throwable t) {
                                 attempt++;
@@ -241,9 +301,8 @@ public final class ShizukuManager {
                                 // nuevo; si no se puede, caemos a accesibilidad.
                                 if (attempt >= MAX_EXEC_ATTEMPTS) {
                                     shell = null;
-                                    ConnectionLog.add("Shizuku: exec('" + shortCmd(cmd)
-                                            + "') falló tras " + attempt + " intentos");
-                                    Log.w(TAG, "exec('" + cmd + "') falló: " + t);
+                                    ConnectionLog.add("Shizuku: exec('" + action + "') falló tras " + attempt + " intentos");
+                                    Log.w(TAG, "exec('" + action + "') falló: " + t);
                                     return;
                                 }
                                 synchronized (gate) { gate.wait(EXEC_RETRY_DELAY_MS); }
@@ -263,13 +322,13 @@ public final class ShizukuManager {
             }
             if (result[0] == null) {
                 ConnectionLog.add("Shizuku: timeout (" + EXEC_TIMEOUT_MS
-                        + "ms) en '" + shortCmd(cmd) + "', usando accesibilidad");
+                        + "ms) en '" + action + "', usando accesibilidad");
                 return false;
             }
             return true;
         } catch (Throwable t) {
-            ConnectionLog.add("Shizuku: no se pudo encolar '" + shortCmd(cmd) + "'");
-            Log.w(TAG, "no se pudo encolar '" + cmd + "': " + t);
+            ConnectionLog.add("Shizuku: no se pudo encolar '" + action + "'");
+            Log.w(TAG, "no se pudo encolar '" + action + "': " + t);
             return false;
         }
     }

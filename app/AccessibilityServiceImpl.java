@@ -179,6 +179,29 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         filter.addAction(ACTION_DISPLAY);
         filter.addAction(ACTION_DISPLAY_BACK);
         registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+        // Cargar configuración persistente de pantallas virtuales desde
+        // Settings.Global overlay_display_devices. Si hay valor guardado,
+        // aplicarlo como si el usuario hubiera ejecutado "on" desde amctl.
+        String savedOverlay = android.provider.Settings.Global.getString(
+                getContentResolver(), SETTING_OVERLAY_DISPLAYS);
+        if (savedOverlay != null && !savedOverlay.isEmpty()) {
+            // Simular el manejador de "on": ancho x alto / dpi [,flags]
+            // Formato AOSP: "w x h / dpi[,flag1][,flag2];[display2];..."
+            String[] slashParts = savedOverlay.split("/", 2);
+            if (slashParts.length == 2) {
+                String dims = slashParts[0];
+                String[] dp = dims.split("x");
+                if (dp.length == 2) {
+                    int w = Integer.parseInt(dp[0]);
+                    int h = Integer.parseInt(dp[1]);
+                    // Separar dpi de posibles flags (ej: "320,own_content_only")
+                    String[] dpiParts = slashParts[1].split(",", 2);
+                    int dpi = Integer.parseInt(dpiParts[0]);
+                    // Aplicar configuración guardada (flags se manejan por defecto)
+                    applySavedOverlayDisplay(w, h, dpi);
+                }
+            }
+        }
         // Calienta Shizuku: si ya tiene permiso, deja el UserService enlazado
         // para que el primer comando vaya por shell y no por el arranque lento
         // de accessibility. Si no está, no pasa nada.
@@ -230,7 +253,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 int x = intent.getIntExtra("x", -1);
                 int y = intent.getIntExtra("y", -1);
                 if (x < 0 || y < 0) return;
-                if (!ShizukuManager.runShell(disp(intent), "input tap " + x + " " + y))
+                if (!ShizukuManager.runShell(disp(intent), "input_tap", x, y, 80L))
                     run(makeTap(x, y, 80L, disp(intent)), "tap");
                 break;
             }
@@ -239,8 +262,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 int y = intent.getIntExtra("y", -1);
                 long dur = intent.getLongExtra("duration", 500);
                 if (x < 0 || y < 0) return;
-                if (!ShizukuManager.runShell(disp(intent),
-                        "input swipe " + x + " " + y + " " + x + " " + y + " " + dur))
+                if (!ShizukuManager.runShell(disp(intent), "input_swipe", x, y, x, y, dur))
                     run(makeTap(x, y, dur, disp(intent)), "longpress");
                 break;
             }
@@ -251,8 +273,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 int y2 = intent.getIntExtra("y2", -1);
                 long dur = intent.getLongExtra("duration", 300);
                 if (x1 < 0 || x2 < 0) return;
-                if (!ShizukuManager.runShell(disp(intent),
-                        "input swipe " + x1 + " " + y1 + " " + x2 + " " + y2 + " " + dur))
+                if (!ShizukuManager.runShell(disp(intent), "input_swipe", x1, y1, x2, y2, dur))
                     run(makeSwipe(x1, y1, x2, y2, dur, disp(intent)), "swipe");
                 break;
             }
@@ -260,8 +281,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 android.util.DisplayMetrics dm = metricsOf(disp(intent));
                 int x = intent.getIntExtra("x", dm.widthPixels / 2);
                 int y = intent.getIntExtra("y", (int)(dm.heightPixels * 0.5f));
-                if (!ShizukuManager.runShell(disp(intent),
-                        "input swipe " + x + " " + y + " " + x + " " + (y + (int)(dm.heightPixels * -0.4f)) + " 200"))
+                if (!ShizukuManager.runShell(disp(intent), "input_swipe", x, y, x, (int)(y + (dm.heightPixels * -0.4f)), 200L))
                     run(makeScroll(x, y, -0.4f, disp(intent)), "scrollUp");
                 break;
             }
@@ -269,21 +289,20 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 android.util.DisplayMetrics dm = metricsOf(disp(intent));
                 int x = intent.getIntExtra("x", dm.widthPixels / 2);
                 int y = intent.getIntExtra("y", (int)(dm.heightPixels * 0.5f));
-                if (!ShizukuManager.runShell(disp(intent),
-                        "input swipe " + x + " " + y + " " + x + " " + (y + (int)(dm.heightPixels * 0.4f)) + " 200"))
+                if (!ShizukuManager.runShell(disp(intent), "input_swipe", x, y, x, (int)(y + (dm.heightPixels * 0.4f)), 200L))
                     run(makeScroll(x, y, 0.4f, disp(intent)), "scrollDown");
                 break;
             }
             case ACTION_BACK:
-                if (!ShizukuManager.runShell(disp(intent), "input keyevent 4"))
+                if (!ShizukuManager.runShell(disp(intent), "input_keyevent", 4))
                     performGlobalAction(GLOBAL_ACTION_BACK);
                 break;
             case ACTION_HOME:
-                if (!ShizukuManager.runShell(disp(intent), "input keyevent 3"))
+                if (!ShizukuManager.runShell(disp(intent), "input_keyevent", 3))
                     performGlobalAction(GLOBAL_ACTION_HOME);
                 break;
             case ACTION_RECENTS:
-                if (!ShizukuManager.runShell(disp(intent), "input keyevent 187"))
+                if (!ShizukuManager.runShell(disp(intent), "input_keyevent", 187))
                     performGlobalAction(GLOBAL_ACTION_RECENTS);
                 break;
             case ACTION_TYPE: {
@@ -918,6 +937,24 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             return;
         }
         saveDisplays("op desconocido: " + op);
+    }
+
+    /* -------------------------------------------------------------- */
+    /*                        Gesture builders                        */
+    /* -------------------------------------------------------------- */
+    private void applySavedOverlayDisplay(int w, int h, int dpi) {
+        // Mismos flags que al ejecutar "on" sin mirror explícito
+        LinkedHashSet<String> flags = new LinkedHashSet<>();
+        flags.add("own_content_only");
+        String value = w + "x" + h + "/" + dpi
+            + (flags.isEmpty() ? "" : "," + String.join(",", flags));
+        try {
+            android.provider.Settings.Global.putString(getContentResolver(), SETTING_OVERLAY_DISPLAYS, value);
+            Log.i(TAG, "pantalla virtual restaurada desde configuración guardada: " + value);
+            saveDisplays(null);
+        } catch (Exception e) {
+            saveDisplays("fallo al restaurar overlay_display_devices: " + e);
+        }
     }
 
     /* -------------------------------------------------------------- */
