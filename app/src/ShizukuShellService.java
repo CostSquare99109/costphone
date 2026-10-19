@@ -179,53 +179,40 @@ public class ShizukuShellService extends ICostPhoneShell.Stub {
 
     /** Ejecuta comando usando ProcessBuilder con argumentos separados (SIN shell) y timeout */
     private String execInternal(String[] cmd) {
-        if (cmd == null || cmd.length == 0) return "";
+        if (cmd == null || cmd.length == 0) return;
         Process p = null;
+        StringBuilder out = new StringBuilder();
+        BufferedReader r = null;
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
             p = pb.start();
-            BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            StringBuilder out = new StringBuilder();
-            String line;
-            // Leer output con timeout
+            r = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            // Reader thread to consume output concurrently
             Thread readerThread = new Thread(() -> {
                 try {
                     String line;
-                    BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
                     while ((line = r.readLine()) != null) {
-                        // Output se ignora en operaciones no-screencap, o se puede acumular si necesario
+                        out.append(line).append("\n");
                     }
                 } catch (IOException ignored) {}
             });
             readerThread.start();
-
-            boolean finished = p.waitFor(COMMAND_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            boolean finished = p.waitFor(10000, TimeUnit.MILLISECONDS);
             if (!finished) {
                 p.destroyForcibly();
+                try { readerThread.join(2000); } catch (InterruptedException ignored) {}
                 return "error: command timeout";
             }
-
-            // Leer output completo después de que termine
-            while ((line = r.readLine()) != null) out.append(line).append('\n');
+            try { readerThread.join(); } catch (InterruptedException ignored) {}
+            // Drain any remaining output after thread finishes
+            String line;
+            while ((line = r.readLine()) != null) out.append(line).append("\n");
             return out.toString();
         } catch (Throwable t) {
-            String cmdStr = String.join(" ", cmd);
-            Log.w(TAG, "shell exec('" + cmdStr + "') falló: " + t);
+            Log.w(TAG, "shell exec failed: " + t);
             return "error: " + t;
         } finally {
-            // waitFor ya limpió el proceso
+            try { if (r != null) r.close(); } catch (IOException ignored) {}
+            try { if (p != null) p.destroy(); } catch (Exception ignored) {}
         }
-    }
-
-    @Override
-    public void exit() {
-        destroy();
-    }
-
-    /** Reservado por Shizuku: lo llama el servidor cuando hay que tirar el servicio. */
-    @Override
-    public void destroy() {
-        System.exit(0);
-    }
-}

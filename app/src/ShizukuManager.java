@@ -239,7 +239,7 @@ public final class ShizukuManager {
                                         // Validar coordenadas no negativas y duración razonable
                                         int x = (int) args[0];
                                         int y = (int) args[1];
-                                        long dur = (long) args[2];
+                                        long tapDuration = (long) args[2];
                                         if (x < 0 || y < 0 || dur < 0 || dur > 8000) {
                                             throw new IllegalArgumentException("input_tap: invalid coords or duration");
                                         }
@@ -251,7 +251,7 @@ public final class ShizukuManager {
                                         int y1 = (int) args[1];
                                         int x2 = (int) args[2];
                                         int y2 = (int) args[3];
-                                        long dur = (long) args[4];
+                                        long swipeDuration = (long) args[4];
                                         if (x1 < 0 || y1 < 0 || x2 < 0 || y2 < 0 || dur < 0 || dur > 8000) {
                                             throw new IllegalArgumentException("input_swipe: invalid coords or duration");
                                         }
