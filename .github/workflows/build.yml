@@ -63,9 +63,11 @@ jobs:
       - name: Check keystore secret present
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "::error::Secret KEYSTORE_BASE64 esta vacio. CostPhone no se firma con clave de debug en CI."
+            echo "::error::Secret KEYSTORE_BASE64 vacio en $GITHUB_REPOSITORY para evento $GITHUB_EVENT_NAME. CostPhone no se firma con clave de debug en CI."
             exit 1
           fi
           echo "KEYSTORE_BASE64 presente."
