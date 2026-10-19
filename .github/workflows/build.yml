@@ -109,9 +109,17 @@ jobs:
         if: failure()
         run: |
           echo "=== Build Failed Summary ==="
-          # Show last 50 lines of build output
+          # Show last 200 lines of build output for error diagnosis
           if [ -f build_output.txt ]; then
-              tail -n 50 build_output.txt
+              echo "--- Build output (last 200 lines) ---"
+              tail -n 200 build_output.txt
+              echo "--- End of build output ---"
+              # Also include build diagnostic if available
+              if [ -f .build-diagnostic.txt ]; then
+                  echo "--- Build diagnostic (.build-diagnostic.txt) ---"
+                  cat .build-diagnostic.txt
+                  echo "--- End of build diagnostic ---"
+              fi
           else
               echo "No build output file found"
           fi
@@ -136,11 +144,11 @@ jobs:
           if-no-files-found: error
 
       - name: Upload diagnostic artifact (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Build-Diagnostics
           path: app/diag-artifacts/
-          if: always()
 
       - name: Publish to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')

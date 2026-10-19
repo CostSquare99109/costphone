@@ -135,11 +135,8 @@ KEY_PASSWORD="${KEY_PASSWORD:-android}"
 KEYSTORE_MASKED="${KEYSTORE// /_}"
 echo "✓ Keystore configured: $KEYSTORE_MASKED" >> "$DIAGNOSTIC"
 
-rm -rf "$OUT"
-mkdir -p "$OUT"
-cd "$PROJ"
-
-echo "=== Build Starting ===" >> "$DIAGNOSTIC"
+# Build proceeds - DO NOT rm -rf $OUT here, it would delete the diagnostic
+# The initial cleanup at line 11 already handles directory preparation
 
 # 1. Compile resources → binary resource zip
 echo "[1/7] Compile resources (aapt2 capture)..." >> "$DIAGNOSTIC"
