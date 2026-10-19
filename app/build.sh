@@ -46,12 +46,12 @@ echo "✓ Using android.jar: " >> "$DIAGNOSTIC"
 echo "=== Phase 2: Android JDK Platform ===" >> "$DIAGNOSTIC"
 ANDROID_JAR="$SDK_ROOT/platforms/android-34/android.jar"
 if [[ ! -f "$ANDROID_JAR" ]]; then
-    ANDROID_JAR=$(ls "$SDK_ROOT"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)
+    ANDROID_JAR=$(ls "$SDK_ROOT"/platforms/android-*/android.jar | sort -V | tail -1)
 fi
 if [[ -z "$ANDROID_JAR" || ! -f "$ANDROID_JAR" ]]; then
     echo "✗ android.jar not found in $SDK_ROOT/platforms/" >> "$DIAGNOSTIC"
     echo "Installed platforms:" >> "$DIAGNOSTIC"
-    ls "$SDK_ROOT"/platforms/ 2>/dev/null >> "$DIAGNOSTIC" || echo "  (none found)" >> "$DIAGNOSTIC"
+    ls "$SDK_ROOT"/platforms/ >> "$DIAGNOSTIC" || echo "  (none found)" >> "$DIAGNOSTIC"
     echo "SDK platform not found" >> "$DIAGNOSTIC"
     exit 1
 fi
@@ -70,7 +70,7 @@ if [[ -n "${BUILD_TOOLS_VERSION:-}" ]]; then
         exit 1
     fi
 else
-    BT_CANDIDATES=$(ls -d "$SDK_ROOT"/build-tools/* 2>/dev/null | sort -V)
+    BT_CANDIDATES=$(ls -d "$SDK_ROOT"/build-tools/* | sort -V)
     if [[ -z "$BT_CANDIDATES" ]]; then
         echo "✗ No build-tools found in $SDK_ROOT/build-tools/" >> "$DIAGNOSTIC"
         echo "No build-tools found" >> "$DIAGNOSTIC"
@@ -207,8 +207,8 @@ if [[ ${#AIDLFILES[@]} -gt 0 ]]; then
 else
     echo "     (no AIDL files to process)" >> "$DIAGNOSTIC"
 fi
-AIDLJAVA=($(find "$OUT/aidl_java" -name '*.java' 2>/dev/null | sort))
-RJAVA=($(find "$OUT/r_java" -name '*.java' 2>/dev/null | sort))
+AIDLJAVA=($(find "$OUT/aidl_java" -name '*.java' | sort))
+RJAVA=($(find "$OUT/r_java" -name '*.java' | sort))
 
 # Colección explícita de fuentes Java que deben compilarse
 SRCS=(
@@ -265,7 +265,7 @@ echo "✓ d8 OK" >> "$DIAGNOSTIC"
 echo "[6/7] Embed classes.dex into APK..." >> "$DIAGNOSTIC"
 cp "$OUT/base.apk" "$OUT/unsigned.apk"
 cd "$OUT/dex"
-zip -j "$OUT/unsigned.apk" classes.dex 2>&1 | tail -3 >> "$DIAGNOSTIC" 2>/dev/null || true
+zip -j "$OUT/unsigned.apk" classes.dex 2>&1 | tail -3 >> "$DIAGNOSTIC"
 cd "$PROJ"
 echo "✓ unsigned.apk OK" >> "$DIAGNOSTIC"
 
@@ -303,7 +303,7 @@ echo "✓ apksigner OK" >> "$DIAGNOSTIC"
 # Verify
 echo "" >> "$DIAGNOSTIC"
 echo "=== Verification ===" >> "$DIAGNOSTIC"
-run_apksigner verify -v "$OUT/CostPhone.apk" 2>&1 | head -10 >> "$DIAGNOSTIC" 2>/dev/null || echo "Verification errored" >> "$DIAGNOSTIC"
+run_apksigner verify -v "$OUT/CostPhone.apk" 2>&1 | head -10 >> "$DIAGNOSTIC"
 
 echo "" >> "$DIAGNOSTIC"
 echo "=== Build Complete ===" >> "$DIAGNOSTIC"

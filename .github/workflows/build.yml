@@ -88,11 +88,14 @@ jobs:
           # Initialize exit code
           BASH_EXIT=0
           # Save build script output and exit code
-          bash build.sh > build_output.txt 2>&1 || BASH_EXIT=$?
+          bash -x build.sh > build_output.txt 2>&1 || BASH_EXIT=$?
           echo "BASH_EXIT=$BASH_EXIT" >> build_output.txt
+          tail -n 80 build_output.txt > build_output.tmp && mv build_output.tmp build_output.txt
           # Always save diagnostics even on failure
           mkdir -p diag-artifacts
           cp build_output.txt diag-artifacts/build_output.txt
+          # Mask passwords in build output for GitHub Actions log safety
+          sed -i -E 's/(KEYSTORE_PASSWORD|KEY_PASSWORD|KEY_ALIAS)=.*/\1=***/g' build_output.txt
           # Copy internal diagnostic from app/build/
           if [ -f build/.build-diagnostic.txt ]; then
               cp build/.build-diagnostic.txt diag-artifacts/build-diagnostic.txt
