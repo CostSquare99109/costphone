@@ -93,6 +93,12 @@ jobs:
           # Always save diagnostics even on failure
           mkdir -p diag-artifacts
           cp build_output.txt diag-artifacts/build_output.txt
+          # Copy the internal build diagnostic with non-hidden name
+          if [ -f .build-diagnostic.txt ]; then
+              cp .build-diagnostic.txt diag-artifacts/build-diagnostic.txt
+          else
+              echo "Diagnostic file .build-diagnostic.txt not found (expected build phase may have been skipped)"
+          fi
           # Check APK status after build
           if [ -f build/CostPhone.apk ] && [ -s build/CostPhone.apk ]; then
               echo "APK exists and has content: $(wc -c < build/CostPhone.apk) bytes"
@@ -109,19 +115,21 @@ jobs:
         if: failure()
         run: |
           echo "=== Build Failed Summary ==="
-          # Show last 200 lines of build output for error diagnosis
-          if [ -f build_output.txt ]; then
+          # Show build output from the last 200 lines (app/ directory)
+          if [ -f app/build_output.txt ]; then
               echo "--- Build output (last 200 lines) ---"
-              tail -n 200 build_output.txt
+              tail -n 200 app/build_output.txt
               echo "--- End of build output ---"
-              # Also include build diagnostic if available
-              if [ -f .build-diagnostic.txt ]; then
-                  echo "--- Build diagnostic (.build-diagnostic.txt) ---"
-                  cat .build-diagnostic.txt
-                  echo "--- End of build diagnostic ---"
-              fi
           else
-              echo "No build output file found"
+              echo "No app/build_output.txt found"
+          fi
+          # Show build diagnostic if available (app/diag-artifacts/ directory)
+          if [ -f app/diag-artifacts/build-diagnostic.txt ]; then
+              echo "--- Build diagnostic (app/diag-artifacts/build-diagnostic.txt) ---"
+              cat app/diag-artifacts/build-diagnostic.txt
+              echo "--- End of build diagnostic ---"
+          else
+              echo "No app/diag-artifacts/build-diagnostic.txt found"
           fi
           # Check APK status
           if [ -f build/CostPhone.apk ]; then
