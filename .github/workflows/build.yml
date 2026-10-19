@@ -86,19 +86,18 @@ jobs:
         run: |
           cd app
           # Save build script output and exit code
+          set -euo pipefail
           bash build.sh > build_output.txt 2>&1 || BASH_EXIT=$?
           echo "BASH_EXIT=$BASH_EXIT" >> build_output.txt
-          # Always list the APK (even if build failed, it might be from a previous run)
-          ls -la build/CostPhone.apk 2>/dev/null || echo "No APK found"
-          # Always upload the diagnostic output as artifact
-          mkdir -p diag-artifacts
-          cp build_output.txt diag-artifacts/build_output.txt
-          # Always try to list APK state
+          # Always list the APK status (even if build failed)
           if [ -f build/CostPhone.apk ]; then
               echo "APK exists: $(wc -c < build/CostPhone.apk) bytes"
           else
-              echo "APK not found"
+              echo "APK not found after build"
           fi
+          # Always upload the diagnostic output as artifact
+          mkdir -p diag-artifacts
+          cp build_output.txt diag-artifacts/build_output.txt
 
       - name: Diagnostics Summary (if failed)
         if: failure()
@@ -113,9 +112,9 @@ jobs:
           # Check APK status
           if [ -f build/CostPhone.apk ]; then
               echo "APK exists: $(wc -c < build/CostPhone.apk) bytes"
-              "$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)/apksigner" verify --print-certs build/CostPhone.apk 2>&1 | head -5 || echo "Verification failed or not possible"
+              "$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)/apksigner" verify --print-certs build/CostPhone.apk 2>&1 | head -5 || echo "Verification not possible"
           else
-              echo "APK not found after build"
+              echo "APK not found after build - see build_output.txt for errors"
           fi
 
       - name: Print APK certificate SHA-256
@@ -128,7 +127,6 @@ jobs:
         with:
           name: CostPhone
           path: app/build/CostPhone.apk
-          if-no-files-found: error
 
       - name: Upload diagnostic artifact (always)
         uses: actions/upload-artifact@v4

@@ -102,9 +102,14 @@ echo "✓ apksigner validated" >> "$DIAGNOSTIC"
 echo "✓ All tools validated in $SDK_BT" >> "$DIAGNOSTIC"
 
 # --- Safe command runners ---
-run_d8() { bash "$SDK_BT/d8" "$@"; }
+run_d8() { "$SDK_BT/d8" "$@"; }
 run_apksigner() { java -jar "$SDK_BT/lib/apksigner.jar" "$@"; }
 run_aapt2() { "$SDK_BT/aapt2" "$@"; }
+JAVA_CMD="$JAVA_HOME/bin/javac"
+if [[ ! -x "$JAVA_CMD" ]]; then
+    JAVA_CMD=$(command -v javac)
+fi
+run_java_compile() { "$JAVA_CMD" "$@"; }
 
 # --- Keystore ---
 echo "=== Phase 5: Keystore ===" >> "$DIAGNOSTIC"
@@ -131,7 +136,7 @@ echo "=== Build Starting ===" >> "$DIAGNOSTIC"
 # 1. Compile resources → binary resource zip
 echo "[1/7] Compile resources (aapt2 capture)..." >> "$DIAGNOSTIC"
 set +e
-RAAPT2_OUT=$(/data/data/com.termux/files/usr/bin/aapt2 compile --dir res -o "$OUT/res.zip" 2>&1)
+RAAPT2_OUT=$(run_aapt2 compile --dir res -o "$OUT/res.zip" 2>&1)
 RAAPT2_EXIT=$?
 set -e
 echo "$RAAPT2_OUT" >> "$DIAGNOSTIC"
@@ -146,7 +151,7 @@ echo "✓ aapt2 compile OK" >> "$DIAGNOSTIC"
 # 2. Link resources → generates R.java AND builds resources into base APK
 echo "[2/7] Link resources (aapt2 link)..." >> "$DIAGNOSTIC"
 set +e
-LINK_OUT=$(/data/data/com.termux/files/usr/bin/aapt2 link -o "$OUT/base.apk" --manifest AndroidManifest.xml -I "$ANDROID_JAR" --java "$OUT/r_java" "$OUT/res.zip" 2>&1)
+LINK_OUT=$(run_aapt2 link -o "$OUT/base.apk" --manifest AndroidManifest.xml -I "$ANDROID_JAR" --java "$OUT/r_java" "$OUT/res.zip" 2>&1)
 LINK_EXIT=$?
 set -e
 echo "$LINK_OUT" >> "$DIAGNOSTIC"
@@ -199,15 +204,31 @@ else
 fi
 AIDLJAVA=($(find "$OUT/aidl_java" -name '*.java' 2>/dev/null | sort))
 
+# Colección explícita de fuentes Java que deben compilarse
+SRCS=(
+    "app/src/ConnectionLog.java"
+    "app/src/KeepAliveService.java"
+    "app/src/SettingsActivity.java"
+    "app/src/ShizukuManager.java"
+    "app/src/ShizukuShellService.java"
+)
+
+# RJAVADIR no usado directamente; las fuentes van como argumentos individuales
+RJAVADIR=""
+
 # 4. Compile Java + R.java
 echo "[4/7] Compile Java sources..." >> "$DIAGNOSTIC"
 set +e
-javac_output=$(/data/data/com.termux/files/usr/lib/jvm/java-21-openjdk/bin/javac \
+JAVA_CMD="$JAVA_HOME/bin/javac"
+if [[ ! -x "$JAVA_CMD" ]]; then
+    JAVA_CMD=$(command -v javac)
+fi
+javac_output=$($JAVA_CMD \
     --source 1.8 --target 1.8 \
     --bootclasspath "$ANDROID_JAR" \
     -d "$OUT/classes" \
     -classpath "$FULLCP" \
-    "${SRCS[@]}" "${RJAVADIR}" ${AIDLJAVA[@]+"${AIDLJAVA[@]}"} 2>&1)
+    "${SRCS[@]}" ${AIDLJAVA[@]+"${AIDLJAVA[@]}"} 2>&1)
 javac_exit=$?
 set -e
 echo "$javac_output" >> "$DIAGNOSTIC"
@@ -222,7 +243,7 @@ echo "✓ javac OK" >> "$DIAGNOSTIC"
 # 5. Convert → classes.dex
 echo "[5/7] Create DEX (d8)..." >> "$DIAGNOSTIC"
 set +e
-DEX_OUT=$(/data/data/com.termux/files/usr/bin/d8 "$OUT/classes" --output "$OUT/dex" --lib "$ANDROID_JAR" --min-api 24 ${LIBJARS[@]+"${LIBJARS[@]}"} 2>&1)
+DEX_OUT=$(run_d8 "$OUT/classes" --output "$OUT/dex" --lib "$ANDROID_JAR" --min-api 24 ${LIBJARS[@]+"${LIBJARS[@]}"} 2>&1)
 DEX_EXIT=$?
 set -e
 echo "$DEX_OUT" >> "$DIAGNOSTIC"
