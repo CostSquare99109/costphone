@@ -93,11 +93,11 @@ jobs:
           # Always save diagnostics even on failure
           mkdir -p diag-artifacts
           cp build_output.txt diag-artifacts/build_output.txt
-          # Copy the internal build diagnostic with non-hidden name
-          if [ -f .build-diagnostic.txt ]; then
-              cp .build-diagnostic.txt diag-artifacts/build-diagnostic.txt
+          # Copy internal diagnostic from app/build/
+          if [ -f build/.build-diagnostic.txt ]; then
+              cp build/.build-diagnostic.txt diag-artifacts/build-diagnostic.txt
           else
-              echo "Diagnostic file .build-diagnostic.txt not found (expected build phase may have been skipped)"
+              echo "Diagnostic file build/.build-diagnostic.txt not found"
           fi
           # Check APK status after build
           if [ -f build/CostPhone.apk ] && [ -s build/CostPhone.apk ]; then
