@@ -36,7 +36,7 @@ jobs:
           echo "ANDROID_HOME: $ANDROID_HOME"
           echo "SDK root exists: $([ -d "$ANDROID_HOME" ] && echo yes || echo no)"
           # List ANDROID_HOME contents
-          ls -la "$ANDROOD_HOME"/platforms/ 2>/dev/null || echo "No platforms dir"
+          ls -la "$ANDROID_HOME"/platforms/ 2>/dev/null || echo "No platforms dir"
           ls -la "$ANDROID_HOME"/build-tools/ 2>/dev/null || echo "No build-tools dir"
           # Check sdkmanager availability
           which sdkmanager 2>/dev/null || echo "sdkmanager not in PATH"
@@ -77,7 +77,7 @@ jobs:
           printf '%s' "$KEYSTORE_BASE64" | base64 -d > /tmp/costphone.keystore
           echo "KEYSTORE_PATH=/tmp/costphone.keystore" >> "$GITHUB_ENV"
 
-      - name: Build APK
+      - name: Build APK with diagnostics
         env:
           KEYSTORE_PATH: /tmp/costphone.keystore
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -85,8 +85,38 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           cd app
-          bash build.sh
-          ls -la build/CostPhone.apk
+          # Save build script output and exit code
+          bash build.sh > build_output.txt 2>&1 || BASH_EXIT=$?
+          echo "BASH_EXIT=$BASH_EXIT" >> build_output.txt
+          # Always list the APK (even if build failed, it might be from a previous run)
+          ls -la build/CostPhone.apk 2>/dev/null || echo "No APK found"
+          # Always upload the diagnostic output as artifact
+          mkdir -p diag-artifacts
+          cp build_output.txt diag-artifacts/build_output.txt
+          # Always try to list APK state
+          if [ -f build/CostPhone.apk ]; then
+              echo "APK exists: $(wc -c < build/CostPhone.apk) bytes"
+          else
+              echo "APK not found"
+          fi
+
+      - name: Diagnostics Summary (if failed)
+        if: failure()
+        run: |
+          echo "=== Build Failed Summary ==="
+          # Show last 50 lines of build output
+          if [ -f build_output.txt ]; then
+              tail -n 50 build_output.txt
+          else
+              echo "No build output file found"
+          fi
+          # Check APK status
+          if [ -f build/CostPhone.apk ]; then
+              echo "APK exists: $(wc -c < build/CostPhone.apk) bytes"
+              "$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)/apksigner" verify --print-certs build/CostPhone.apk 2>&1 | head -5 || echo "Verification failed or not possible"
+          else
+              echo "APK not found after build"
+          fi
 
       - name: Print APK certificate SHA-256
         run: |
@@ -99,6 +129,13 @@ jobs:
           name: CostPhone
           path: app/build/CostPhone.apk
           if-no-files-found: error
+
+      - name: Upload diagnostic artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-Diagnostics
+          path: app/diag-artifacts/
+          if: always()
 
       - name: Publish to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
