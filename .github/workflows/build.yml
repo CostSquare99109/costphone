@@ -31,11 +31,34 @@ jobs:
           log-accepted-android-sdk-licenses: false
           packages: platform-tools
 
+      - name: Verify Android SDK setup
+        run: |
+          echo "ANDROID_HOME: $ANDROID_HOME"
+          echo "SDK root exists: $([ -d "$ANDROID_HOME" ] && echo yes || echo no)"
+          # List ANDROID_HOME contents
+          ls -la "$ANDROOD_HOME"/platforms/ 2>/dev/null || echo "No platforms dir"
+          ls -la "$ANDROID_HOME"/build-tools/ 2>/dev/null || echo "No build-tools dir"
+          # Check sdkmanager availability
+          which sdkmanager 2>/dev/null || echo "sdkmanager not in PATH"
+          # Try sdkmanager --help
+          sdkmanager --list 2>&1 | head -5 || echo "sdkmanager list failed"
+
       - name: Install platform and build-tools (>= 34)
         run: |
           set -euo pipefail
           sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
           echo "ANDROID_HOME=$ANDROID_HOME"
+          # Verify installation
+          echo "Checking installed platforms:"
+          ls "$ANDROID_HOME"/platforms/android-34/ 2>/dev/null || echo "android-34 not found"
+          echo "Checking build-tools:"
+          ls "$ANDROID_HOME"/build-tools/ 2>/dev/null || echo "No build-tools dir"
+          # Verify aapt2 is available
+          which aapt2 2>/dev/null || echo "aapt2 not found"
+          # Verify d8 is available
+          which d8 2>/dev/null || echo "d8 not found"
+          # Verify apksigner is available
+          which apksigner 2>/dev/null || echo "apksigner not found"
 
       - name: Check keystore secret present
         env:
@@ -82,3 +105,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: app/build/CostPhone.apk
+
