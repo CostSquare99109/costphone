@@ -114,6 +114,11 @@ amctl clickid <id> | amctl tapref @pN     # 5. actuar (0.5-1.4s)
 Para una web, el paso 2 es `amctl openurl "<url>"` en vez de `launch` (Chrome
 restaura la sesión anterior si lo lanzas a pelo).
 
+**Antes de actuar, consulta [🧠 TRAMPAS UNIVERSALES](#-trampas-universales-y-patrones-por-tipo-de-ui)**:
+ahí está el "cómo elijo el objetivo" y las 8 trampas que se repiten en *toda*
+app Android. Aplicar los patrones es lo que separa un agente que funciona en
+WhatsApp de uno que funciona en cualquier app.
+
 ## El bucle central (igual filosofía que agent-browser)
 
 ```
@@ -165,7 +170,7 @@ sistema). Ya no hay que adivinar coordenadas del teclado: Enter y ⌫ son refs.
 | `amctl type "texto"` | Escribe en el campo con foco ([edt][FOCUS] en snap). **REEMPLAZA todo el contenido** (setText), desconocido no appenda. Si el campo lo rechaza (input web/React), cae solo al **teclado en pantalla** |
 | `amctl cleartext` | Vacía el campo con foco |
 | `amctl paste` | Pega el clipboard en el campo con foco |
-| `amctl focus "texto"` | Da foco a un campo por texto (o resource-id) |
+| `amctl focus "texto"` | Da foco a un campo cuyo **texto o descripción** contenga ese texto |
 | `amctl openurl <url>` | Navega al URL en el Chrome default — SIN pelear con el omnibox (mejor que tap URL + type + Enter) |
 | `amctl float <texto> [pkg]` | Pon la app en ventana flotante (recents → long-press → "ventanas flotantes" de MIUI). `float X pkg Y split` = pantalla dividida |
 | `amctl back` / `home` / `recents` | Botones del sistema |
@@ -187,8 +192,9 @@ con `click "texto"` en vez de escribir. Si dice "el campo rechazó el texto
 (ni setText ni teclado)", es un input web/React: el servicio cae entonces al
 **teclado en pantalla** y escribe pulsando las teclas (`escrito (teclado): …`);
 si el teclado no está visible, ábrelo antes (toca el campo y espera a que
-salgan las teclas `[ime]`) y reintenta. Con `type --settle` o un `tapref`
-previo con más margen, el campo suele aceptar el texto.
+salgan las teclas `[ime]`) y reintenta. Con un plazo de espera mayor
+(`amctl type "texto" 1000`) o un `tapref` previo con más margen, el campo
+suele aceptar el texto.
 
 **Regla:** desde v1.3 `type` **verifica** que el texto aparezca en pantalla
 antes de decir "escrito". Si te dice que escribió, está escrito.
@@ -197,60 +203,183 @@ Para navegar (Chrome/otro navegador): SIEMPRE primero
 `amctl openurl "https://..."` — saltarse el omnibox evita autocompletados,
 Enter fallido a ciegas, y páginas erróneas.
 
-## YouTube: buscar y reproducir (receta verificada)
+---
 
-Los atajos que fallan en YouTube, y lo que funciona:
+# 🧠 TRAMPAS UNIVERSALES Y PATRONES POR TIPO DE UI
 
-| Atajo | Qué pasa | ✅ Lo que funciona |
-|---|---|---|
-| `scroll down` para bajar en los resultados | el gesto aterriza en System UI (panel de notificaciones) | `amctl swipe 540 1700 540 700 700` — un arrastre, como un dedo |
-| `waitfor "Buscar"` tras abrir la app | si la app restauró la página anterior, no existe ese botón | `waitfor` de lo que de verdad quieres ver, o `snap` y decide |
-| `click "Saltar anuncio"` | el texto vive en el overlay **padre** y en el botón: el clic cae en el padre y no salta nada | `amctl clickid skip_ad_button` (id corto, tal cual lo muestra el snapshot) |
-| `waitfor "<título del video>"` | el overlay del reproductor **se oculta a los ~3 s**: si el waitfor empieza después, expira aunque el video esté cargado | verifica con la **barra de progreso**: `snap --filter "minutos"` → `"0 minutos 14 segundos de 3 minutos y 33 segundos"` (duración real) |
-| tocar el reproductor para "despertar" los controles | en YouTube un toque en la superficie **pausa** el video | usa `back` o `clickid` sobre el botón de play real |
+> Las trampas de esta sección **no son de ninguna app**: son de cómo están
+> hechas las interfaces de Android. Si las conoces, sabes lo que va a pasar
+> en una app que nunca has visto. Los ejemplos (WhatsApp, Gmail, Play Store…)
+> son solo instancias; el patrón vale para cualquier otra.
 
-Pista de oro: **una duración de ≤60 s = es el anuncio**; la duración del video real
-(3 min 33 s en Poker Face) es la prueba de que la reproducción es la buena.
+## Cómo elegir el objetivo (decisión en 4 preguntas)
 
-Flujo natural completo (sin deep-links):
+Antes de tocar nada, mira el `snap` y decide:
+
+1. **¿El elemento tiene id corto?** (`#send`, `#conversation_row`)
+   → `amctl clickid <id>`. Es lo **más estable**: los ids no cambian con el
+   idioma ni con el contenido.
+2. **¿No tiene id pero su texto es único y corto?**
+   → `amctl click "<texto>"`. El servicio elige el nodo más específico (el
+   botón, no el contenedor que concatena el texto de sus hijos).
+3. **¿Es una fila de lista y quieres abrir el elemento?**
+   → `amctl tapref @pN` sobre **la fila completa** (id `*_row_container`,
+   `*_item`, `*_cell`), nunca sobre el título suelto.
+4. **¿El texto sale truncado o repetido?**
+   → `amctl snap -a` para ver el texto completo, o `tapref` sobre la fila.
+
+## ⚠️ Las 8 trampas universales
+
+### 1. El nodo que "contiene" el texto es un contenedor
+- **Síntoma:** `click "texto"` no hace nada, o abre un **detalle o un menú** en
+  vez de la acción principal; responde "el elemento 'X' no aceptó el click".
+- **Por qué:** en una fila o en un overlay, el nodo con ese texto es un
+  **contenedor** que concatena el texto de sus hijos, y es el único marcado
+  como **clicable**. El botón de verdad (el hijo) tiene el texto pero no
+  acepta `ACTION_CLICK`. El click cae en el padre.
+- **Fix:** `tapref @pN` sobre el nodo **más profundo** que tiene ese texto
+  (el hijo, no el padre) o `clickid <id>`. En el snapshot el padre y el hijo
+  salen como **dos líneas distintas** con el mismo texto:
+  ```
+  @p18 [FrameLayout] '1' #E01(59,1667)      <- el contenedor (padre)
+  @p19 [TextView]    '1' #0_resource_name_obfuscated(59,1657)   <- el hijo
+  ```
+  Elige la del **texto exacto y el id propio**, no la concatenada.
+- **Apps:** WhatsApp, Telegram, Gmail, Slack, Discord, Instagram DMs,
+  overlays de anuncios y de cookies.
+
+### 2. Fila con zonas múltiples (icono ≠ título ≠ mensaje)
+- **Síntoma:** dentro de una misma fila hay un icono que navega a un sitio, un
+  título que abre otro y el mensaje que va a un tercero. Un click "a ciegas"
+  por el título acaba en el sitio equivocado.
+- **Por qué:** cada zona es un nodo distinto dentro de la fila.
+- **Fix:** **nunca `click` por el título de una fila.** Usa `tapref` sobre la
+  fila (`*_row_container`) o `click` sobre el texto del **mensaje**.
+- **Apps:** toda lista maestra-detalle (chats, correos, notificaciones,
+  settings).
+
+### 3. Search bar con placeholder que cambia
+- **Síntoma:** `waitfor "Buscar"` expira aunque la barra esté ahí. El
+  placeholder depende del idioma, de la pantalla, o la app restauró la sesión
+  anterior.
+- **Fix:** espera por el **id estable**, sin la almohadilla
+  (`amctl waitfor "search_input" 8000`), o localiza la barra con
+  `amctl snap --filter "search"` y `tapref`.
+- **Apps:** Chrome, Play Store, Settings, cualquier toolbar con buscador.
+
+### 4. Un overlay tapa el botón (teclado, banner, toolbar flotante)
+- **Síntoma:** `clickid send` falla o toca otra cosa **después** de abrir el
+  teclado; el botón "se ha ido".
+- **Por qué:** el teclado o una barra flotante (Seleccionar todo/Pegar) son
+  **otra ventana**: recalculan el layout y lo que había debajo ya no está
+  donde estaba. Las refs viejas apuntan a otro sitio.
+- **Fix:** `amctl snap` **después** de abrir el teclado (las refs cambian) y
+  `tapref` sobre la ref nueva. Si el botón queda tapado por el teclado,
+  ciérralo (`amctl back`) o usa las refs `[ime]`. Y `tapref @pN --settle 500`
+  para que el snapshot posterior no salga antes de que el layout se asiente.
+- **Apps:** WhatsApp, Telegram, formularios web, cualquier pantalla con teclado.
+
+### 5. RecyclerView: el elemento existe pero no está en pantalla
+- **Síntoma:** `click "X"` responde "no se encontró el texto 'X'" aunque
+  X esté en la lista. O `snap` no lo muestra.
+- **Por qué:** las listas largas solo materializan las filas visibles.
+- **Fix:** `scroll down` + `snap --filter` **en bucle** hasta encontrarlo.
+- **Apps:** cualquier lista larga (chats, feeds, tiendas, histórico).
+
+### 6. Texto truncado ("…")
+- **Síntoma:** `click "Asunto muy largo..."` no encuentra nada, porque el
+  nodo tiene "Asunto muy largo…" (con puntos suspensivos reales) o está
+  cortado a media palabra.
+- **Fix:** `click` por un **substring único** sin los puntos, o `tapref` sobre
+  la fila, o `snap -a` para ver el texto completo.
+- **Apps:** Gmail (asuntos), WhatsApp (previews), feeds, notificaciones.
+
+### 7. Estado "cargando" ≠ estado "vacío"
+- **Síntoma:** `waitfor "Cargando"` expira y la lista sigue vacía; o al revés,
+  `waitfor` salta con un mensaje de error antes de que haya datos.
+- **Fix:** espera a un texto que **solo existe cuando hay contenido** (no a
+  un spinner), y comprueba con `snap --filter` que hay refs. Si la lista
+  sigue vacía, es que la carga falló: `snap -a` y lee el texto de error.
+- **Apps:** feeds, stores, chats, dashboards.
+
+### 8. Tocar y snapshotear en la misma llamada
+- **Síntoma:** `tapref @p3 && snap` devuelve el snapshot **anterior** al
+  toque: el gesto tarda ~80 ms y la app tarda en reaccionar.
+- **Fix:** `tapref @p3 --settle 500` (o `;` en vez de `&&` + un snap
+  posterior). El settle lo duerme el servidor.
+- **Apps:** todas.
+
+## 📐 Patrones por tipo de UI (plantillas)
+
+### A. Lista maestra → detalle (chats, correos, notificaciones, settings)
 
 ```bash
-amctl launch com.google.android.youtube
-amctl click "Buscar"; amctl waitfor "Buscar en YouTube" 6000
-amctl type "poker face lady gaga"                     # verificado: "escrito: …"
-amctl tapref @p4 --settle 1500                       # @p4 = fila de sugerencia (autocompletado)
-amctl swipe 540 1700 540 700 700                     # baja a los vídeos (2 swipes)
-amctl snap --filter "Official"                       # @p1 = "Lady Gaga - Poker Face (Official Music Video)"
-amctl tapref @p1 --settle 1200                       # abre el video
-amctl clickid skip_ad_button                         # salta el anuncio (si lo hay)
-amctl snap --filter "minutos"                        # verifica: "... de 3 minutos y 33 segundos"
+amctl launch <pkg>; amctl waitfor "<texto de la lista>" 10000
+amctl snap --filter "<texto de la fila>"     # @pN = la FILA completa
+amctl tapref @pN --settle 500                # abrir el detalle
+amctl waitfor "<texto del detalle>" 5000
 ```
+**Regla:** el objetivo del `snap --filter` es un texto **de la fila**, y el
+`tapref` va a la **fila**, no a su título. Si no sale, `scroll down` y repite
+(trampa 5).
 
-El autocompletado de YouTube **tapa los resultados**: el `waitfor "<consulta>"`
-da falso positivo porque la sugerencia ya contiene ese texto. Toca la fila de
-sugerencia para de verdad buscar, y verifica con el `snap` de resultados.
-
-
+### B. Formulario o campo de texto (chat, búsqueda, login)
 
 ```bash
-amctl launch com.whatsapp
-amctl waitfor "buscar" 10000              # barra "Preguntar a Meta AI o buscar"
-amctl snap                                  # @p1 = barra de búsqueda
-amctl tapref @p1
-amctl type "+57 310 4618120"
-amctl waitfor "310 4618120" 10000           # el campo ya tiene el número
-amctl snap --filter "4618120"              # @pN = fila del contacto (row_container)
-amctl tapref @pN                            # abre el chat
-amctl waitfor "Mensaje" 8000
-amctl type "Hola"
-amctl snap --filter "Enviar"                # @pN = botón #send
-amctl tapref @pN
-amctl snap --filter "Hola" -a               # verificar la burbuja enviada
+amctl clickid <id_del_campo>                 # o: tapref @pN del [edt][FOCUS]
+amctl cleartext                               # solo si hay texto previo
+amctl type "<texto exacto>"                   # REEMPLAZA el contenido
+amctl snap --filter "<texto exacto>"          # VERIFICAR antes de enviar
+amctl clickid <id_de_enviar>                 # id corto: send, submit, done
 ```
+**Reglas:** `type` **reemplaza**, no añade. Verifica con un `snap --filter`
+antes de enviar. Envía por **id** (`clickid send`), no por texto ("Enviar" /
+"Enviar" / "→" cambian entre apps e idiomas).
 
-Notas del caso real: el `type` **reemplaza** el contenido del campo, así que
-para escribir un número en un buscador que ya tenía texto, `type` vale.
-El contacto del ejemplo era el propio número ("+57 310 4618120 (Tú)").
+### C. Navegación por tabs o barra inferior
+
+```bash
+amctl clickid <id_del_tab>                   # tab_chats, tab_calls, tab_settings
+```
+**Regla:** **nunca click por la etiqueta visible** del tab (se trunca, cambia
+con el idioma, y a veces la etiqueta es un icono sin texto). El id del tab es
+estable. Si no hay id, `tapref` sobre el elemento del tab en el snapshot.
+**Apps:** WhatsApp, Telegram, Instagram, X/Twitter, Gmail, Slack, Discord,
+Google Play, Chrome, Ajustes.
+
+### D. Modal, bottom sheet o diálogo
+
+```bash
+amctl waitfor "<título del modal>" 5000      # el modal ya está
+amctl snap --filter "<título del modal>"     # snapshot SOLO del modal
+amctl clickid <id_del_boton>                 # button_confirm, button_cancel
+```
+**Regla:** filtra por un texto **único del modal** para no confundirte con el
+fondo. Si el modal tiene un botón *atrás* propio, `clickid` a ese id antes
+de usar `back` (el `back` del sistema puede cerrar la app entera).
+
+### E. WebView, canvas o híbrido (no sale en el árbol)
+
+```bash
+amctl clickid <id_del_campo>; amctl cleartext
+amctl type "<texto>" 1000                    # 2º argumento = plazo en ms
+amctl ocr "<texto del botón>" --region x,y,w,h   # último recurso
+amctl tapshot X Y W H                            # toca lo que viste en la captura
+```
+**Regla:** si el texto no sale en `snap`, no existe para el árbol: o es un
+`WebView` (el texto vive en el DOM, no en la accesibilidad), o es un canvas.
+Ahí el camino es OCR + `tapshot`. Con `--region` el OCR baja de ~19 s a ~2,6 s.
+**Apps:** X/Twitter web, Instagram web, Biblioteca de Anuncios de Meta,
+Feeds y listas de cualquier WebView.
+
+### F. Lista larga con scroll (feeds, tiendas, histórico)
+
+```bash
+amctl snap --filter "<texto>" || amctl scroll down; amctl snap --filter "<texto>"
+```
+Bucle: `scroll down` + `snap --filter` hasta que aparezca. En feeds donde el
+gesto se lo queda el sistema, usa `amctl swipe X1 Y1 X2 Y2 [ms]` (un arrastre,
+como un dedo) en vez de `scroll`.
 
 ## Pantalla virtual — trabajar aparte sin molestar al usuario (app v1.2+)
 
@@ -323,6 +452,9 @@ Detalle completo y límites: `docs/pantalla-virtual.md` en el repo de CostPhone.
 
 ## Recetas
 
+> Recetas por **situación**. Para las que dependen de la *forma* de la UI,
+> mira antes los [patrones por tipo de UI](#-patrones-por-tipo-de-ui-plantillas).
+
 - **Navegar a una página:** `amctl openurl "https://github.com/user/repo/settings/access"`.
   Nunca construir la navegación escribiendo en el omnibox (autocompletado + Enter ciego).
   **Y nunca `amctl launch com.android.chrome` antes:** Chrome restaura la pestaña
@@ -377,3 +509,63 @@ Detalle completo y límites: `docs/pantalla-virtual.md` en el repo de CostPhone.
 - Play Protect bloquea instalar APKs propios ("Aplicación bloqueada") → tocar
   Entendido y reintentar, o desactivar temporalmente el análisis en Play Store
   → Play Protect, instalar, y reactivar. NO es APK corrupto.
+
+## 📎 EJEMPLOS CONCRETOS (instancias de los patrones de arriba)
+
+> Estas recetas son ejemplos reales de los patrones. **Si necesitas la receta
+> de una app que no está aquí, aplica los patrones**: son universales.
+
+### YouTube: buscar y reproducir
+
+Los atajos que fallan en YouTube, y lo que funciona:
+
+| Atajo | Qué pasa | ✅ Lo que funciona |
+|---|---|---|
+| `scroll down` para bajar en los resultados | el gesto aterriza en System UI (panel de notificaciones) | `amctl swipe 540 1700 540 700 700` — un arrastre, como un dedo |
+| `waitfor "Buscar"` tras abrir la app | si la app restauró la página anterior, no existe ese botón | `waitfor` de lo que de verdad quieres ver, o `snap` y decide |
+| `click "Saltar anuncio"` | el texto vive en el overlay **padre** y en el botón: el clic cae en el padre y no salta nada | `amctl clickid skip_ad_button` (id corto, tal cual lo muestra el snapshot) |
+| `waitfor "<título del video>"` | el overlay del reproductor **se oculta a los ~3 s**: si el waitfor empieza después, expira aunque el video esté cargado | verifica con la **barra de progreso**: `snap --filter "minutos"` → `"0 minutos 14 segundos de 3 minutos y 33 segundos"` (duración real) |
+| tocar el reproductor para "despertar" los controles | en YouTube un toque en la superficie **pausa** el video | usa `back` o `clickid` sobre el botón de play real |
+
+Pista de oro: **una duración de ≤60 s = es el anuncio**; la duración del video real
+(3 min 33 s en Poker Face) es la prueba de que la reproducción es la buena.
+
+Flujo natural completo (sin deep-links):
+
+```bash
+amctl launch com.google.android.youtube
+amctl click "Buscar"; amctl waitfor "Buscar en YouTube" 6000
+amctl type "poker face lady gaga"                     # verificado: "escrito: …"
+amctl tapref @p4 --settle 1500                       # @p4 = fila de sugerencia (autocompletado)
+amctl swipe 540 1700 540 700 700                     # baja a los vídeos (2 swipes)
+amctl snap --filter "Official"                       # @p1 = "Lady Gaga - Poker Face (Official Music Video)"
+amctl tapref @p1 --settle 1200                       # abre el video
+amctl clickid skip_ad_button                         # salta el anuncio (si lo hay)
+amctl snap --filter "minutos"                        # verifica: "... de 3 minutos y 33 segundos"
+```
+
+El autocompletado de YouTube **tapa los resultados**: el `waitfor "<consulta>"`
+da falso positivo porque la sugerencia ya contiene ese texto. Toca la fila de
+sugerencia para de verdad buscar, y verifica con el `snap` de resultados.
+
+### WhatsApp: buscar un contacto y escribirle
+
+```bash
+amctl launch com.whatsapp
+amctl waitfor "buscar" 10000              # barra "Preguntar a Meta AI o buscar"
+amctl snap                                  # @p1 = barra de búsqueda
+amctl tapref @p1
+amctl type "+57 310 4618120"
+amctl waitfor "310 4618120" 10000           # el campo ya tiene el número
+amctl snap --filter "4618120"              # @pN = fila del contacto (row_container)
+amctl tapref @pN                            # abre el chat
+amctl waitfor "Mensaje" 8000
+amctl type "Hola"
+amctl snap --filter "Enviar"                # @pN = botón #send
+amctl tapref @pN
+amctl snap --filter "Hola" -a               # verificar la burbuja enviada
+```
+
+Notas del caso real: el `type` **reemplaza** el contenido del campo, así que
+para escribir un número en un buscador que ya tenía texto, `type` vale.
+El contacto del ejemplo era el propio número ("+57 310 4618120 (Tú)").
