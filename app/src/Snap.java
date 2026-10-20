@@ -48,13 +48,18 @@ final class Snap {
      * - filter: substring (sin distinguir mayúsculas) sobre etiqueta o id.
      */
     static List<Pick> select(List<Node> nodes, boolean allMode, String filter) {
+        return select(index(nodes), allMode, filter);
+    }
+
+    static List<Pick> select(Index idx, boolean allMode, String filter) {
         List<Pick> picks = new ArrayList<>();
         String flt = filter == null ? null : filter.toLowerCase();
+        List<Node> nodes = idx.nodes;
         for (int i = 0; i < nodes.size(); i++) {
             Node nd = nodes.get(i);
             boolean keep = nd.interactive() || (allMode && nd.hasText());
             if (!keep) continue;
-            String label = labelOf(nodes, i);
+            String label = idx.labelOf(i);
             label = label.replace("\n", " ").trim();
             if (flt != null && !flt.isEmpty()) {
                 String lid = nd.vid == null ? "" : nd.vid.toLowerCase();
@@ -69,6 +74,170 @@ final class Snap {
         return picks;
     }
 
+    /**
+     * Primer nodo cuyo texto (o id) contiene "needle".
+     *
+     * Es la búsqueda que hace waitfor en cada iteración. Recorre los nodos
+     * SIN construir las etiquetas de los que no tienen texto propio: solo
+     * se unen los textos de los descendientes cuando el nodo no trae el
+     * suyo. Así el sondeo cada 120 ms no cuesta O(n²).
+     *
+     * Solo se miran los nodos que serían "picks" en modo allMode (los que
+     * tienen texto o son interactivos), que es el criterio del waitfor
+     * anterior: si un nodo no sale en el snapshot, tampoco puede aparecer.
+     */
+    static int findMatch(Index idx, String needle) {
+        String n = needle.toLowerCase();
+        List<Node> nodes = idx.nodes;
+        for (int i = 0; i < nodes.size(); i++) {
+            Node nd = nodes.get(i);
+            if (!nd.interactive() && !nd.hasText()) continue;
+            String own = !nd.txt.isEmpty() ? nd.txt : nd.desc;
+            String label = !own.isEmpty() ? own : idx.joinChildren(i);
+            String lid = nd.vid == null ? "" : nd.vid;
+            // mismo criterio que el waitfor anterior: etiqueta + " " + id
+            if (containsIgnoreCase(label, n)) return i;
+            if (!lid.isEmpty() && containsIgnoreCase(lid, n)) return i;
+        }
+        return -1;
+    }
+
+    private static boolean containsIgnoreCase(String hay, String lowerNeedle) {
+        return hay.toLowerCase().contains(lowerNeedle);
+    }
+
+    /* -------------------------------------------------------------- */
+    /*  Índice de etiquetas: O(n) en vez de O(n²)                     */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Índice de un árbol de nodos: precalcula los textos de los
+     * descendientes de cada nodo.
+     *
+     * Antes, labelOf() llamaba a childText(), que recorría TODOS los
+     * descendientes por cada nodo: O(n²). Con 3500 nodos eso son millones
+     * de comparaciones de cadenas y el snapshot se arrastra (cientos de ms
+     * o segundos). Aquí los textos se propagan de abajo arriba en una sola
+     * pasada: O(n).
+     */
+    static final class Index {
+        final List<Node> nodes;
+        /** Para cada nodo: hasta 4 textos distintos de sus descendientes. */
+        private final List<String[]> texts;
+        private final int[] parent;
+
+        Index(List<Node> nodes) {
+            this.nodes = nodes;
+            int n = nodes.size();
+            parent = new int[n];
+            texts = new ArrayList<>(n);
+
+            // 1) ancestro más cercano en la lista (para cada nodo)
+            int[] stack = new int[n];
+            int sp = 0;
+            for (int i = 0; i < n; i++) {
+                int d = nodes.get(i).depth;
+                while (sp > 0 && nodes.get(stack[sp - 1]).depth >= d) sp--;
+                parent[i] = sp > 0 ? stack[sp - 1] : -1;
+                stack[sp++] = i;
+            }
+
+            // 2) propagación de abajo arriba: los hijos (índice mayor) se
+            //    resuelven antes que su padre.
+            for (int i = 0; i < n; i++) texts.add(EMPTY);
+            for (int i = n - 1; i >= 0; i--) {
+                Node nd = nodes.get(i);
+                String raw = !nd.txt.isEmpty() ? nd.txt : nd.desc;
+                // mine = contribución de los hijos = textos de los descendientes
+                String[] li = cap4(texts.get(i));
+                texts.set(i, li);
+                int p = parent[i];
+                if (p >= 0) {
+                    // la contribución de este nodo a su padre es su texto
+                    // propio seguido de los de sus descendientes
+                    String[] contrib = prepend(raw, li);
+                    // al recorrer en reversa, anteponer deja el orden final
+                    // en pre-orden (igual que el childText de antes)
+                    texts.set(p, distinct(concat(contrib, texts.get(p))));
+                }
+            }
+        }
+
+        private static final String[] EMPTY = new String[0];
+
+        /** Concatena dos listas. */
+        private static String[] concat(String[] a, String[] b) {
+            String[] out = new String[a.length + b.length];
+            System.arraycopy(a, 0, out, 0, a.length);
+            System.arraycopy(b, 0, out, a.length, b.length);
+            return out;
+        }
+
+        /** Quita repetidos conservando el orden (tope holgado de 8). */
+        private static String[] distinct(String[] a) {
+            List<String> out = new ArrayList<>(8);
+            for (int i = 0; i < a.length; i++) {
+                String s = a[i];
+                if (s == null || s.isEmpty()) continue;
+                if (out.contains(s)) continue;
+                out.add(s);
+                if (out.size() >= 8) break;
+            }
+            return out.toArray(new String[0]);
+        }
+
+        /** Pone "s" delante, sin repetir. */
+        private static String[] prepend(String s, String[] a) {
+            if (s == null || s.isEmpty()) return a;
+            List<String> out = new ArrayList<>(8);
+            out.add(s);
+            for (int i = 0; i < a.length; i++) {
+                String x = a[i];
+                if (x == null || x.isEmpty()) continue;
+                if (out.contains(x)) continue;
+                out.add(x);
+                if (out.size() >= 8) break;
+            }
+            return out.toArray(new String[0]);
+        }
+
+        private static String[] cap4(String[] a) {
+            if (a.length <= 4) return a;
+            String[] out = new String[4];
+            System.arraycopy(a, 0, out, 0, 4);
+            return out;
+        }
+
+        /** Textos de los descendientes del nodo i (como el childText de antes). */
+        String[] childTexts(int i) { return texts.get(i); }
+
+        /** Etiqueta de un nodo: su texto, o el de sus hijos si no tiene. */
+        String labelOf(int i) {
+            Node nd = nodes.get(i);
+            if (!nd.txt.isEmpty()) return nd.txt;
+            if (!nd.desc.isEmpty()) return nd.desc;
+            return joinChildren(i);
+        }
+
+        /** Une los textos de los descendientes con " · " (y recorta a 70). */
+        String joinChildren(int i) {
+            String[] arr = texts.get(i);
+            if (arr.length == 0) return "";
+            StringBuilder sb = new StringBuilder();
+            for (int k = 0; k < arr.length; k++) {
+                if (k > 0) sb.append(" · ");
+                sb.append(arr[k]);
+            }
+            String s = sb.toString();
+            return s.length() > 70 ? s.substring(0, 70) : s;
+        }
+    }
+
+    /** Construye el índice de etiquetas de un árbol. */
+    static Index index(List<Node> nodes) {
+        return new Index(nodes);
+    }
+
     /** Texto de un nodo: el suyo, o el de sus hijos si no tiene. */
     static String labelOf(List<Node> nodes, int i) {
         Node nd = nodes.get(i);
@@ -77,7 +246,7 @@ final class Snap {
         return childText(nodes, i, 4, 70);
     }
 
-    /** Concatena los textos de los descendientes (como el parser de antes). */
+    /** Concatena los textos de los descendientes (versión lineal, sin índice). */
     static String childText(List<Node> nodes, int i, int limit, int width) {
         int depth = nodes.get(i).depth;
         List<String> parts = new ArrayList<>();

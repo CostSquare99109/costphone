@@ -41,7 +41,7 @@ echo "     ✓ R.java → $RJAVADIR"
 # 3. Compile Java + R.java
 echo "[3/7] Compile Java sources..."
 mkdir -p "$OUT/classes"
-SRCS=($(find "$PROJ" -maxdepth 2 -name '*.java' | sort))
+SRCS=($(find "$PROJ" -maxdepth 2 -name '*.java' -not -path "$PROJ/tests/*" | sort))
 javac -encoding UTF-8 \
     -source 1.8 -target 1.8 \
     -bootclasspath "$ANDROID_JAR" \
