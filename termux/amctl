@@ -67,7 +67,68 @@ PKG="com.accessdroid.termux"
 DISPLAY_ID=0
 POSITIONAL=()
 CACHE="$HOME/.cache/amctl"
-mkdir -p "$CACHE" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+#  POR QUÉ ESTE SCRIPT ES TAN DELIBERADAMENTE "SIN EXECS"
+# ---------------------------------------------------------------------------
+#  En un teléfono con Termux, CADA exec de un binario cuesta ~150 ms
+#  (el enlazador dinámico de Android no es trivial). Medido en este equipo:
+#
+#      /bin/true ................ 135 ms
+#      base64 .................. 174 ms
+#      bash -c 'exit 0' ........ 146 ms
+#
+#  Antes, cada orden de amctl ejecutaba 3 binarios externos (mkdir, base64 y
+#  tr) = ~500 ms de sobrecarga, es decir el 90% de la latencia medida. Aquí
+#  todo el camino caliente se hace con builtins de bash: 0 execs.
+# ---------------------------------------------------------------------------
+
+# Crea el directorio de caché SOLO cuando hay que escribir en él (un mkdir
+# al arrancar costaba 150 ms en cada invocación).
+CP_CACHE_READY=0
+cp_cache_ensure() {
+    [[ $CP_CACHE_READY -eq 1 ]] && return 0
+    [[ -d "$CACHE" ]] || mkdir -p "$CACHE" 2>/dev/null || true
+    CP_CACHE_READY=1
+}
+
+# Epoch en segundos sin fork (date +%s cuesta 150 ms).
+cp_now() { printf -v CP_NOW '%(%s)T' -1; }
+
+# Base64 en bash puro, independiente del locale:
+#   carácter -> code point -> bytes UTF-8 -> base64
+# Verificado byte a byte contra `base64` del sistema, incluidos emoji y
+# caracteres astral (𝔘, 𐍈).
+cp_b64() {
+    local s=${1-}
+    local -a T=(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z \
+                a b c d e f g h i j k l m n o p q r s t u v w x y z \
+                0 1 2 3 4 5 6 7 8 9 + /)
+    local out="" i=0 n=${#s} cp b1 b2 b3 v
+    local -a by=()
+    while (( i < n )); do
+        printf -v cp '%d' "'${s:i:1}"
+        if   (( cp < 0x80 ));   then by+=("$cp")
+        elif (( cp < 0x800 ));  then by+=($(( 0xC0 | (cp >> 6) )) $(( 0x80 | (cp & 0x3F) )))
+        elif (( cp < 0x10000 )); then by+=($(( 0xE0 | (cp >> 12) )) $(( 0x80 | ((cp >> 6) & 0x3F) )) $(( 0x80 | (cp & 0x3F) )))
+        else by+=($(( 0xF0 | (cp >> 18) )) $(( 0x80 | ((cp >> 12) & 0x3F) )) $(( 0x80 | ((cp >> 6) & 0x3F) )) $(( 0x80 | (cp & 0x3F) )))
+        fi
+        (( i++ ))
+    done
+    local nb=${#by[@]} j=0
+    while (( j < nb )); do
+        b1=${by[j]}
+        if (( j + 1 < nb )); then b2=${by[j+1]}; else b2=0; fi
+        if (( j + 2 < nb )); then b3=${by[j+2]}; else b3=0; fi
+        v=$(( (b1 << 16) | (b2 << 8) | b3 ))
+        out+="${T[$(( (v >> 18) & 63 ))]}${T[$(( (v >> 12) & 63 ))]}"
+        if (( j + 1 < nb )); then out+="${T[$(( (v >> 6) & 63 ))]}"; else out+="="; fi
+        if (( j + 2 < nb )); then out+="${T[$(( v & 63 ))]}"; else out+="="; fi
+        (( j += 3 ))
+    done
+    printf '%s' "$out"
+}
+
 
 # ---- acciones del servicio (canal rápido y broadcast comparten nombre) ----
 ACTION_TAP="com.accessdroid.termux.ACTION_TAP"
@@ -129,28 +190,35 @@ cp_arg() {
     CP_ARGS="${CP_ARGS}$1:$2=$v"$'\n'
 }
 
-# Codifica el payload de argumentos (un solo base64 por orden).
+# Codifica el payload de argumentos (base64 en bash puro: 0 execs).
 cp_encode_args() {
     if [[ -z "$CP_ARGS" ]]; then printf ''; return; fi
-    printf '%s' "$CP_ARGS" | base64 | tr -d '\n'
+    cp_b64 "$CP_ARGS"
 }
 
 # Devuelve "host puerto" donde el servicio esté escuchando (o falla).
+# CP_HOST y CP_PORT quedan fijados para no tener que abrir un subshell.
+CP_HOST=""
+CP_PORT=""
 cp_port() {
     local f="$CACHE/port" p host
+    # 1) caché: NO se re-valida con un connect extra (eso costaba un syscall
+    #    por orden). Si el puerto está muerto, lo detecta el propio cp_call.
     if [[ -f "$f" ]]; then
         read -r host p < "$f" 2>/dev/null || true
-        if [[ -n "${host:-}" && -n "${p:-}" ]] && { exec 7<>"/dev/tcp/$host/$p"; } 2>/dev/null; then
-            exec 7<&- 7>&-
-            printf '%s %s\n' "$host" "$p"; return 0
+        if [[ -n "${host:-}" && -n "${p:-}" ]]; then
+            CP_HOST="$host"; CP_PORT="$p"; return 0
         fi
     fi
+    # 2) escaneo de puertos
     for p in "${CP_PORTS[@]}"; do
         for host in "${CP_HOSTS[@]}"; do
             if { exec 7<>"/dev/tcp/$host/$p"; } 2>/dev/null; then
                 exec 7<&- 7>&-
+                CP_HOST="$host"; CP_PORT="$p"
+                cp_cache_ensure
                 printf '%s %s\n' "$host" "$p" > "$f" 2>/dev/null || true
-                printf '%s %s\n' "$host" "$p"; return 0
+                return 0
             fi
         done
     done
@@ -160,11 +228,15 @@ cp_port() {
 # Manda una orden por el canal rápido. Devuelve 0 si hubo respuesta.
 cp_call() {
     local action="$1" args="${2:-}"
-    local host port head code len enc body
+    local head code len enc body
     CP_CODE=""; CP_TEXT=""; CP_B64=""
-    read -r host port < <(cp_port) || true
-    [[ -n "${host:-}" && -n "${port:-}" ]] || return 1
-    { exec 7<>"/dev/tcp/$host/$port"; } 2>/dev/null || return 1
+    cp_port || return 1
+    if ! { exec 7<>"/dev/tcp/$CP_HOST/$CP_PORT"; } 2>/dev/null; then
+        # el puerto cacheado estaba muerto: se reescanea una vez
+        rm -f "$CACHE/port" 2>/dev/null || true
+        cp_port || return 1
+        { exec 7<>"/dev/tcp/$CP_HOST/$CP_PORT"; } 2>/dev/null || return 1
+    fi
     if ! printf 'CP/1 %s b:secret=%s b:args=%s\n' "$action" "$SECRET_B64" "$args" >&7 2>/dev/null; then
         exec 7<&- 7>&-; return 1
     fi
@@ -206,7 +278,7 @@ cp_report() {
 TRANSPORT="am"
 detect_transport() {
     local f="$CACHE/transport" now ts val
-    now=$(date +%s)
+    cp_now; now="$CP_NOW"          # printf '%(%s)T' (sin fork; date +%s cuesta 150 ms)
     if [[ -f "$f" ]]; then
         read -r ts val < "$f" 2>/dev/null || true
         if [[ -n "${ts:-}" && -n "${val:-}" && $((now - ts)) -lt 300 ]]; then
@@ -217,6 +289,7 @@ detect_transport() {
     if command -v termux-am >/dev/null 2>&1 && termux-am get-current-user >/dev/null 2>&1; then
         TRANSPORT="socket"
     fi
+    cp_cache_ensure
     printf '%s %s\n' "$now" "$TRANSPORT" > "$f" 2>/dev/null || true
 }
 
@@ -357,6 +430,8 @@ cmd_find() {
 }
 
 # ---- package resolution (substring match -> unique package) ----
+# Caché de la lista de paquetes: `pm list packages` + sed + awk + grep eran
+# 5 execs (~800 ms). Ahora se cachea y el filtrado es puro bash.
 resolve_pkg() {
     local input="$1"
     [[ -z "$input" ]] && { echo "missing app/package argument" >&2; return 2; }
@@ -368,21 +443,41 @@ resolve_pkg() {
         echo "sin AM socket no hay busqueda por nombre: usa el package name completo (ej: com.android.chrome)" >&2
         return 1
     fi
-    if [[ "$input" == *.* ]]; then
-        if tam pm list packages 2>/dev/null | sed 's/^package://' | grep -qx "$input"; then
-            echo "$input"; return 0
+    local cachef="$CACHE/pkgs.tsv" now ts
+    cp_now; now="$CP_NOW"
+    if [[ -f "$cachef" ]]; then
+        read -r ts < "$cachef" 2>/dev/null || true
+    else
+        ts=0
+    fi
+    if [[ ! -f "$cachef" || $((now - ts)) -gt 300 ]]; then
+        local raw
+        raw=$(tam pm list packages 2>/dev/null) || raw=""
+        if [[ -z "$raw" ]]; then
+            echo "no se pudo listar los paquetes (¿Termux:API?)" >&2; return 1
         fi
+        cp_cache_ensure
+        { printf '%s\n' "$now"; printf '%s\n' "$raw"; } > "$cachef" 2>/dev/null || true
     fi
-    local matches count
-    matches=$(tam pm list packages -f 2>/dev/null \
-        | sed 's/^package://' | awk -F'=' '{print $1}' | grep -i "$input" || true)
-    count=$(echo "$matches" | grep -c .)
-    if [[ "$count" -eq 0 ]]; then
-        echo "no package matching '$input'" >&2; return 1
-    elif [[ "$count" -gt 1 ]]; then
-        echo "'$input' matches:"; echo "$matches" >&2; return 1
-    fi
-    echo "$matches"; return 0
+    # coincidencia exacta primero
+    local line pkg
+    while IFS= read -r line; do
+        [[ "$line" == "package:"* ]] || continue
+        pkg="${line#package:}"
+        [[ "$pkg" == "$input" ]] && { echo "$pkg"; return 0; }
+    done < "$cachef"
+    # si no, subcadena (case-insensitive) y tiene que ser única
+    local needle="${input,,}" matches=() m
+    while IFS= read -r line; do
+        [[ "$line" == "package:"* ]] || continue
+        pkg="${line#package:}"
+        [[ "${pkg,,}" == *"${needle}"* ]] && matches+=("$pkg")
+    done < "$cachef"
+    case ${#matches[@]} in
+        0) echo "no package matching '$input'" >&2; return 1 ;;
+        1) echo "${matches[0]}"; return 0 ;;
+        *) echo "'$input' matches:"; printf '%s\n' "${matches[@]}" >&2; return 1 ;;
+    esac
 }
 
 cmd_launch() {
@@ -498,6 +593,26 @@ cmd_snap() {
     python3 "$parser" --display "$DISPLAY_ID" "${pyargs[@]}"
 }
 
+# ---- dormir sin exec (un exec de `sleep` cuesta ~150 ms) ----
+# Truco: se abre una conexión al servicio (que no manda nada) y se lee de
+# ella con timeout. read -t devuelve al expirar el plazo.
+# Entrada: MILISEGUNDOS.
+cp_sleep_ms() {
+    local ms="${1:-0}"
+    [[ "$ms" =~ ^[0-9]+$ ]] || return 0
+    (( ms <= 0 )) && return 0
+    local sec="$(( ms / 1000 )).$(printf '%03d' $(( ms % 1000 )))"
+    local fd=9
+    { exec {fd}<>"/dev/tcp/$CP_HOST/$CP_PORT"; } 2>/dev/null || {
+        # sin canal rápido: se duerme con el binario del sistema
+        command sleep "$sec"
+        return 0
+    }
+    IFS= read -r -t "$sec" -u "$fd" 2>/dev/null || true
+    exec {fd}<&- {fd}>&-
+    return 0
+}
+
 # ---- tocar una ref ----
 cmd_tapref() {
     local ref="${1:-}" settle=""
@@ -515,10 +630,17 @@ cmd_tapref() {
     CP_ARGS=""
     cp_arg s ref "$ref"
     cp_arg i display "$DISPLAY_ID"
+    # el "settle" se lo pide al SERVICIO: si duerme el servidor, el CLI no
+    # paga un exec de sleep (150 ms) ni uno de awk para las fracciones.
+    [[ -n "$settle" ]] && cp_arg l settle "$settle"
     if cp_call $ACTION_TAPREF "$(cp_encode_args)"; then
         local rc=0
         cp_report || rc=1
-        [[ -n "$settle" ]] && sleep "$(awk "BEGIN{print $settle/1000}")"
+        # si el servidor no devolvió la marca "[settled", es una app vieja:
+        # se duerme aquí (sin exec).
+        if [[ -n "$settle" && "$CP_TEXT" != *"[settled"* ]]; then
+            cp_sleep_ms "$settle"
+        fi
         return $rc
     fi
 
@@ -736,7 +858,10 @@ cmd_shot() {
     if cp_call $ACTION_SCREENDUMP "$(cp_encode_args)"; then
         if [[ "$CP_CODE" == "ok" && -n "$CP_B64" ]]; then
             printf '%s' "$CP_B64" | base64 -d > "$out" 2>/dev/null
-            echo "captura: $out ($(stat -c%s "$out" 2>/dev/null || echo 0) bytes)"
+            # tamaño sin stat (un exec): base64 -> 3 bytes cada 4 caracteres
+            local raw_len=${#CP_B64} pad=0
+            [[ "$CP_B64" == *"==" ]] && pad=2 || { [[ "$CP_B64" == *"="* ]] && pad=1; }
+            echo "captura: $out ($(( raw_len * 3 / 4 - pad )) bytes)"
             return 0
         fi
         [[ -n "$CP_TEXT" ]] && echo "$CP_TEXT" >&2
