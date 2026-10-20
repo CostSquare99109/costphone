@@ -4,6 +4,11 @@ description: "Control del teléfono Android del usuario desde Termux con amctl (
 ---
 
 > **⚡ CHEAT SHEET**: Ver [CHEATSHEET.md](CHEATSHEET.md) — comandos clave en 30 líneas
+>
+> La cheat sheet está también como **skill propia** (`phone-control-cheatsheet`):
+> son 8 KB con la tabla completa de comandos, las trampas universales y los
+> patrones por tipo de UI. Si ya sabes que vas a controlar el teléfono, carga
+> **esa** en vez de este manual (30 KB) — el contexto es dinero.
 
 # phone-control — el teléfono como un navegador
 

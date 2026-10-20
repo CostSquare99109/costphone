@@ -86,6 +86,28 @@ if [ -d "$HOME/.config/opencode" ]; then
     done
     echo "     listo: $SKILL_DIR/ ($(ls -1 "$SKILL_DIR" 2>/dev/null | tr '\n' ' '))"
     echo "     (symlinks a $SRC — siempre al día con el repo)"
+
+    # La cheat sheet además como skill propia: así el agente puede cargar
+    # la referencia de 1 página (119 líneas) sin meterse el manual entero
+    # (571 líneas, ~30k chars) en el contexto. Se GENERA desde CHEATSHEET.md
+    # para que no haya dos copias que se desincronicen.
+    CHEAT_DIR="$(dirname "$SKILL_DIR")/phone-control-cheatsheet"
+    mkdir -p "$CHEAT_DIR"
+    # el manual completo y cp.sh quedan a mano desde la cheat sheet
+    ln -sf "$SRC/SKILL.md" "$CHEAT_DIR/FULL.md" 2>/dev/null || cp "$SRC/SKILL.md" "$CHEAT_DIR/FULL.md"
+    ln -sf "$SRC/cp.sh"    "$CHEAT_DIR/cp.sh" 2>/dev/null || cp "$SRC/cp.sh"    "$CHEAT_DIR/cp.sh"
+    {
+        printf -- '---\n'
+        printf 'name: phone-control-cheatsheet\n'
+        printf 'description: "Referencia de UNA PAGINA de phone-control (amctl): la tabla completa de comandos, las trampas universales de Android y los patrones por tipo de UI. Úsala cuando ya sabes que quieres controlar el telefono y solo necesitas la tabla rapida, sin cargar el manual completo (FULL.md). English: phone-control quick reference."\n'
+        printf -- '---\n\n'
+        # los enlaces relativos se corrigen: desde aquí el manual es FULL.md
+        sed -e 's#\[SKILL\.md\](SKILL\.md)#[SKILL.md](FULL.md)#g' \
+            -e 's#\[docs/pantalla-virtual\.md\](docs/pantalla-virtual\.md)#docs/pantalla-virtual.md#g' \
+            -e 's#\[SPEED_AUDIT\.md\](../../SPEED_AUDIT\.md)#SPEED_AUDIT.md#g' \
+            "$SRC/CHEATSHEET.md"
+    } > "$CHEAT_DIR/SKILL.md"
+    echo "     listo: $CHEAT_DIR/SKILL.md (cheat sheet como skill propia)"
 else
     warn "No hay ~/.config/opencode (¿OpenCode no instalado?) — skill omitida"
 fi

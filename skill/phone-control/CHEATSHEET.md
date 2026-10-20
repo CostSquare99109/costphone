@@ -9,18 +9,15 @@ En un teléfono **cada `exec` de un binario cuesta ~150 ms**: `amctl` es un scri
 ```bash
 . ~/.config/opencode/skills/android/phone-control/cp.sh && cp_snap --filter chat
 ```
+
 `cp_snap [--filter T] [-a]` · `cp_tap X Y` · `cp_swipe X1 Y1 X2 Y2 [ms]` ·
 `cp_scroll up|down` · `cp_back` · `cp_home` · `cp_recents` · `cp_click "txt"` ·
 `cp_clickid id` · `cp_tapref @pN` · `cp_type "txt"` · `cp_cleartext` ·
 `cp_paste` · `cp_waitfor "txt" [ms]` · `cp_launch pkg` · `cp_openurl url` ·
 `cp_see` · `cp_batch "a; b"` · `cp_status` *(mismo formato que `amctl`)*
+**Coste:** `amctl status` 254 ms → **`cp_status` 14 ms** · `amctl snap` 224 ms → **`cp_snap` 89 ms**
 
-| | `amctl` | `cp.sh` |
-|---|---|---|
-| `status` | 254 ms | **14 ms** |
-| `snap` | 224 ms | **89 ms** |
-
-## ⚡ `amctl` — referencia
+## ⚡ `amctl` — referencia completa
 
 | Qué necesitas | Comando | Coste | Nota clave |
 |---|---|---|---|
@@ -28,21 +25,26 @@ En un teléfono **cada `exec` de un binario cuesta ~150 ms**: `amctl` es un scri
 | **Pre-calentar** | `amctl warmup` | 0.02s | Cachea el puerto |
 | **Reactivar servicio** | `amctl enable` | 1-2s | Tras actualizar la app (Android lo desactiva) |
 | **Abrir app** | `amctl launch com.pkg` | 0.3s | Por nombre: `amctl launch whatsapp` |
+| **Buscar apps** | `amctl list` · `amctl find <pkg>` | 0.5s | Lista / busca por paquete |
 | **Abrir URL** | `amctl openurl "https://…"` | 0.4s | Evita el omnibox; `openurl <url> com.android.chrome` fuerza browser |
 | **Esperar texto real** | `amctl waitfor "texto" 10000` | 0.1-2.4s | **Devuelve snapshot con refs** — nunca uses `sleep` |
 | **Ver pantalla (filtro)** | `amctl snap --filter "chat"` | 0.25s | Menos ruido, refs @pN frescas |
 | **Ver todo (texto + interactivos)** | `amctl snap -a` | 0.3s | Pantallas densas |
+| **Árbol crudo** | `amctl tree` | 0.3s | Solo para depurar: formato largo, sin refs |
 | **Click por texto** | `amctl click "Enviar"` | 0.24s | ⚠ ver trampas 1-2 |
 | **Click por id** | `amctl clickid send` | 0.23s | Id corto del snapshot (`#send` → `clickid send`) — **lo más estable** |
 | **Tocar ref** | `amctl tapref @p3 --settle 500` | 0.2s | El settle lo duerme el servidor |
+| **Tocar coordenadas** | `amctl tap X Y [ms]` · `longpress X Y [ms]` | 0.15s | `longpress` = 500 ms por defecto |
 | **Escribir (reemplaza)** | `amctl type "texto" [ms]` | 0.2s | setText **borra** lo anterior; verifica que aparezca |
-| **Vaciar / pegar / enfocar** | `amctl cleartext` · `paste` · `focus "texto"` | 0.2s | |
-| **Scroll semántico** | `amctl scroll down` | 0.2s | La app desplaza su lista; `scrollto "texto"` |
-| **Swipe bruto** | `amctl swipe 540 1700 540 700 700` | 0.2s | Para feeds (donde `scroll` falla) |
-| **Back / Home / Recents** | `amctl back` / `home` / `recents` | 0.15s | `back` sí tiene versión `-d`; los demás son globales |
+| **Vaciar / pegar / enfocar** | `amctl cleartext` · `paste` · `focus "texto"` | 0.2s | `focus` busca texto o descripción |
+| **Scroll semántico** | `amctl scroll down\|up [x y]` | 0.2s | La app desplaza su lista |
+| **Scroll a un texto** | `amctl scrollto "texto"` | 0.2s | Busca y desplaza hasta él |
+| **Swipe bruto** | `amctl swipe X1 Y1 X2 Y2 [ms]` | 0.2s | Para feeds (donde `scroll` falla) |
+| **Back / Home / Recents** | `amctl back` / `home` / `recents` · `presskey back` | 0.15s | `back` sí tiene versión `-d`; los demás son globales |
 | **Varias órdenes (1 proceso)** | `amctl batch "home; back; snap"` | 1 exec | 3 órdenes: 2.2s → 0.44s |
 | **OCR (canvas/WebView)** | `amctl ocr "Actualizar" --region 700,1300,300,120` | 2-3s | Último recurso; sin `--region` ~19s |
 | **Captura JPEG** | `amctl see` | 0.7s | Lee la imagen con `read`; `tapshot X Y W H` para tocar |
+| **Ventana flotante (MIUI)** | `amctl float "texto" [pkg]` | 1-2s | recents → long-press → flotante |
 | **Display virtual ON** | `amctl display on 1080 1920 320` | 1-2s | Luego `amctl displays` para saber el ID real |
 | **Comando en display N** | `amctl -d 2 snap` | igual | Flag `-d`, no subcomando |
 
@@ -74,7 +76,6 @@ estable). ¿Texto único y corto? → `click "<texto>"`. ¿Es una fila? →
 | **C. Tabs / bottom bar** | `clickid <id_del_tab>` — **nunca** por la etiqueta visible |
 | **D. Modal / bottom sheet** | `waitfor "<título>" 5000` → `snap --filter "<título>"` → `clickid <botón>` |
 | **E. WebView / canvas** | `clickid <campo>` → `type "<texto>" 1000` → si no sale: `ocr "<texto>" --region …` → `tapshot X Y W H` |
-| **F. Lista larga** | `snap --filter "<texto>"` \|\| `scroll down` → repetir |
 
 ## ⚡ REGLA DE ORO
 **1 tool-call = 1 línea de bash encadenada** (cada tool-call cuesta ida y vuelta):
@@ -89,7 +90,6 @@ estable). ¿Texto único y corto? → `click "<texto>"`. ¿Es una fila? →
 | `snap` → `tapref` → `snap` → `tapref` | `clickid <id>` o `click "texto"` |
 | Un `amctl` por tool-call | `amctl batch "a; b; c"` en una llamada |
 | `amctl` en bucle | `. cp.sh && cp_*` (0 execs: 254 ms → 14 ms) |
-| `launch com.android.chrome` y luego escribir URL | `openurl "https://…"` |
 
 ## 🔁 BUCLE CENTRAL
 `amctl launch <pkg>` → `amctl snap` (refs @pN) → `amctl tapref @p3` →
