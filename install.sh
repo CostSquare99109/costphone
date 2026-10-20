@@ -5,7 +5,7 @@
 # Instala:
 #   1. Dependencias: termux-am (transporte "am") + python
 #   2. Modificación del "am" de Termux (socket server + PATH)
-#   3. amctl + amctl-snap.py  ->  ~/bin
+#   3. amctl                        ->  ~/bin
 #   4. Skill "phone-control"  ->  ~/.config/opencode/skills/android/
 #   5. Bloque de registro    ->  ~/.config/opencode/AGENTS.md
 #   6. APK CostPhone          ->  abre el instalador en el teléfono
@@ -50,11 +50,10 @@ export PATH="$BIN:$PATH"
 echo "     am --version  =>  $(am --version 2>/dev/null || echo 'NO INSTALADO')"
 
 # --- 3. amctl --------------------------------------------------------------
-step "3/6  Instalando amctl + amctl-snap.py en ~/bin..."
+step "3/6  Instalando amctl en ~/bin..."
 mkdir -p "$BIN"
 cp "$REPO_DIR/termux/amctl" "$BIN/amctl"
-cp "$REPO_DIR/termux/amctl-snap.py" "$BIN/amctl-snap.py"
-chmod +x "$BIN/amctl" "$BIN/amctl-snap.py"
+chmod +x "$BIN/amctl"
 echo "     listo: $BIN/amctl"
 
 # --- 4. Skill para OpenCode ------------------------------------------------

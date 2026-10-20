@@ -278,8 +278,15 @@ cp_report() {
 }
 
 # ==========================================================================
-#  Canal legacy: broadcast + fichero (app vieja o servicio parado)
+#  Canal rápido: ÚNICO transporte (app v1.3+)
 # ==========================================================================
+#  Antes había un canal legacy (broadcast -> fichero en /sdcard -> sondeo)
+#  que costaba 1-5 s por orden. Desde la v1.3 el servicio de accesibilidad
+#  habla por TCP de loopback, así que el legacy se ha eliminado: mantenerlo
+#  solo dejaba trampas (una orden que caía en modo lento sin avisar).
+#
+#  Lo que sí se mantiene es `pm` (list/find/resolve_pkg), que necesita el
+#  socket de Termux:API.
 TRANSPORT="am"
 detect_transport() {
     local f="$CACHE/transport" now ts val
@@ -306,48 +313,9 @@ tam() {
     fi
 }
 
-# ---- envía un broadcast a CostPhone (siempre lleva el secreto y el display) ----
-bc() {
-    local action="$1"; shift
-    if [[ "$DISPLAY_ID" != "0" ]]; then
-        tam broadcast -p "$PKG" -a "$action" --es secret "$SECRET" --ei display "$DISPLAY_ID" "$@" >/dev/null 2>&1
-    else
-        tam broadcast -p "$PKG" -a "$action" --es secret "$SECRET" "$@" >/dev/null 2>&1
-    fi
-}
-
-# ---- espera a que aparezca un fichero (sondeo de 50ms, no de 1s) ----
-wait_file() {
-    local f="$1" timeout="${2:-8}" i=0 max=$(( ${timeout:-8} * 20 ))
-    while (( i < max )); do
-        [[ -f "$f" ]] && return 0
-        sleep 0.05
-        i=$((i+1))
-    done
-    return 1
-}
-
-# ---- avisa (una vez) de que el canal rápido no está ----
-warn_legacy() {
-    [[ -f "$CACHE/warned-legacy" ]] && return 0
-    touch "$CACHE/warned-legacy" 2>/dev/null || true
-    echo "aviso: canal rápido no disponible (app v1.3+ o servicio apagado)." >&2
-    echo "       las órdenes van por broadcast: ~1-5s cada una." >&2
-}
-
-map_file() {
-    if [[ "$DISPLAY_ID" == "0" ]]; then echo "$CACHE/snapshot-map.tsv"
-    else echo "$CACHE/snapshot-map-d$DISPLAY_ID.tsv"; fi
-}
-
 shot_file() {
     if [[ "$DISPLAY_ID" == "0" ]]; then echo "/sdcard/Download/accessdroid-shot.jpg"
     else echo "/sdcard/Download/accessdroid-shot-d$DISPLAY_ID.jpg"; fi
-}
-
-tree_file() {
-    if [[ "$DISPLAY_ID" == "0" ]]; then echo "/sdcard/Download/accessdroid-tree.txt"
-    else echo "/sdcard/Download/accessdroid-tree-d$DISPLAY_ID.txt"; fi
 }
 
 # Ejecuta una orden simple: canal rápido si está; si no, broadcast.
@@ -378,20 +346,17 @@ cp_or_bc() {
         cp_report
         return $?
     fi
-    warn_legacy
-    detect_transport
-    [[ -z "$bcaction" ]] && return 1
-    local extras=()
-    for (( i=0; i<${#P_TYPES[@]}; i++ )); do
-        case "${P_TYPES[$i]}" in
-            i) extras+=(--ei "${P_KEYS[$i]}" "${P_VALS[$i]}") ;;
-            l) extras+=(--el "${P_KEYS[$i]}" "${P_VALS[$i]}") ;;
-            f) extras+=(--ef "${P_KEYS[$i]}" "${P_VALS[$i]}") ;;
-            s) extras+=(--es "${P_KEYS[$i]}" "${P_VALS[$i]}") ;;
-        esac
-    done
-    bc "$bcaction" "${extras[@]}"
-    return 0
+    # sin canal rápido no hay alternativa: el broadcast legacy se eliminó
+    # (era 100x más lento y hacía fallar la orden en silencio).
+    cp_no_channel
+    return 1
+}
+
+# ---- avisa de que el canal rápido no está ----
+cp_no_channel() {
+    echo "canal rápido no disponible: la app v1.3+ debe estar instalada y el" >&2
+    echo "servicio de accesibilidad activado (Ajustes → Accesibilidad →" >&2
+    echo "CostPhone), o ejecuta 'amctl enable' para reactivarlo solo." >&2
 }
 
 # ========================= subcommands =========================
@@ -499,38 +464,8 @@ cmd_launch() {
         cp_report
         return $?
     fi
-
-    warn_legacy
-    detect_transport
-    if [[ "$DISPLAY_ID" != "0" ]]; then
-        bc $ACTION_START_ACTIVITY --es package "$pkg"
-        echo "Launched $pkg on display $DISPLAY_ID"
-        return 0
-    fi
-    if [[ "$TRANSPORT" == "socket" ]]; then
-        local comp
-        comp=$(tam cmd package resolve-activity --brief \
-            -c android.intent.category.LAUNCHER \
-            -a android.intent.action.MAIN "$pkg" 2>/dev/null \
-            | sed 's/^[^:]*: //' | head -1)
-        if [[ -n "$comp" ]]; then
-            tam start --user 0 -n "$comp" 2>/dev/null || { echo "launch failed for $pkg"; return 1; }
-            echo "Launched $pkg -> $comp"
-        else
-            tam monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 2>/dev/null \
-                && echo "Launched $pkg (monkey)" || { echo "launch failed for $pkg"; return 1; }
-        fi
-    else
-        if tam start --user 0 -a android.intent.action.MAIN \
-            -c android.intent.category.LAUNCHER -p "$pkg" >/dev/null 2>&1; then
-            echo "Launched $pkg"
-        elif bc $ACTION_START_ACTIVITY --es package "$pkg"; then
-            echo "Launched $pkg (via CostPhone)"
-        else
-            echo "launch failed for $pkg" >&2
-            return 1
-        fi
-    fi
+    cp_no_channel
+    return 1
 }
 
 cmd_stop()   { detect_transport; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam force-stop "$pkg" 2>/dev/null && echo "Stopped $pkg" || { echo "stop failed"; return 1; }; }
@@ -549,14 +484,8 @@ cmd_tree() {
         [[ "$CP_CODE" == "ok" ]] && return 0
         return 1
     fi
-    warn_legacy
-    local f; f=$(tree_file)
-    rm -f "$f" 2>/dev/null || true
-    bc $ACTION_GET_UI_TREE
-    if wait_file "$f" 8; then cat "$f"; else
-        echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2
-        return 1
-    fi
+    cp_no_channel
+    return 1
 }
 
 # ---- snapshot con refs @pN ----
@@ -571,7 +500,7 @@ cmd_snap() {
         esac
     done
 
-    # canal rápido: el snapshot lo calcula el servicio (sin Python, sin ficheros)
+    # el snapshot lo calcula el servicio (sin Python, sin ficheros)
     CP_ARGS=""
     cp_arg i display "$DISPLAY_ID"
     cp_arg i mode "$mode"
@@ -580,22 +509,8 @@ cmd_snap() {
         cp_report
         return $?
     fi
-
-    # legacy: árbol + parser local
-    warn_legacy
-    local f; f=$(tree_file)
-    rm -f "$f" 2>/dev/null || true
-    bc $ACTION_GET_UI_TREE
-    if ! wait_file "$f" 8; then
-        echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2
-        return 1
-    fi
-    local parser="$HOME/bin/amctl-snap.py" pyargs=()
-    [[ -f "$parser" ]] || parser="$CACHE/amctl-snap.py"
-    [[ -f "$parser" ]] || { echo "(no encuentro amctl-snap.py — reinstala con install.sh)" >&2; return 1; }
-    [[ "$mode" == "1" ]] && pyargs+=("-a")
-    [[ -n "$filter" ]] && pyargs+=("--filter" "$filter")
-    python3 "$parser" --display "$DISPLAY_ID" "${pyargs[@]}"
+    cp_no_channel
+    return 1
 }
 
 # ---- dormir sin exec (un exec de `sleep` cuesta ~150 ms) ----
@@ -648,19 +563,8 @@ cmd_tapref() {
         fi
         return $rc
     fi
-
-    # legacy: la tabla de refs la escribió el parser local
-    warn_legacy
-    ref="${ref#@}"; [[ "$ref" != p* ]] && ref="p$ref"
-    local MAP; MAP=$(map_file)
-    [[ -f "$MAP" ]] || { echo "no hay snapshot — ejecuta: amctl snap" >&2; return 1; }
-    local line; line=$(awk -F'\t' -v r="$ref" '$1==r{print; exit}' "$MAP")
-    [[ -z "$line" ]] && { echo "ref @$ref no existe — re-ejecuta: amctl snap" >&2; return 1; }
-    local cx cy; cx=$(printf '%s' "$line" | cut -f2); cy=$(printf '%s' "$line" | cut -f3)
-    bc $ACTION_TAP --ei x "$cx" --ei y "$cy" --el duration 80
-    echo "tap @$ref -> ($cx,$cy)"
-    [[ -n "$settle" ]] && sleep "$(awk "BEGIN{print $settle/1000}")"
-    return 0
+    cp_no_channel
+    return 1
 }
 
 # ---- esperar a que aparezca un texto ----
@@ -676,18 +580,7 @@ cmd_waitfor() {
         cp_report
         return $?
     fi
-    # legacy: sondea el snapshot local hasta que aparezca
-    warn_legacy
-    local deadline=$(( $(date +%s%3N) + timeout )) out
-    while (( $(date +%s%3N) < deadline )); do
-        out=$(cmd_snap --filter "$text" 2>/dev/null)
-        if [[ -n "$out" ]] && ! grep -q "sin elementos interactivos" <<<"$out"; then
-            printf '%s\n' "$out"
-            return 0
-        fi
-        sleep 0.2
-    done
-    echo "timeout: '$text' no apareció en ${timeout}ms" >&2
+    cp_no_channel
     return 1
 }
 
@@ -726,23 +619,8 @@ cmd_openurl() {
         cp_report
         return $?
     fi
-    warn_legacy
-    detect_transport
-    if [[ "$DISPLAY_ID" != "0" ]]; then
-        local errf=/sdcard/Download/accessdroid-error.txt
-        rm -f "$errf" 2>/dev/null || true
-        bc $ACTION_OPEN_URI --es uri "$url" --ei display "$DISPLAY_ID"
-        sleep 1
-        [[ -f "$errf" ]] && echo "⚠ $(cat "$errf")"
-        echo "openurl: $url (display $DISPLAY_ID)"
-        return 0
-    fi
-    if tam start --user 0 -a android.intent.action.VIEW -d "$url" ${app:+-p "$app"} >/dev/null 2>&1; then
-        echo "openurl: $url${app:+ -> $app}"
-    else
-        echo "openurl failed for $url" >&2
-        return 1
-    fi
+    cp_no_channel
+    return 1
 }
 
 # ---- captura de pantalla ----
@@ -872,31 +750,8 @@ cmd_shot() {
         [[ -n "$CP_TEXT" ]] && echo "$CP_TEXT" >&2
         return 1
     fi
-
-    # legacy: la app escribe el fichero y lo leemos de ahí
-    warn_legacy
-    local base png
-    if [[ "$DISPLAY_ID" == "0" ]]; then
-        png=""; base="/sdcard/Download/accessdroid-shot"
-    else
-        base="/sdcard/Download/accessdroid-shot-d$DISPLAY_ID"; png=""
-    fi
-    rm -f "${base}.png" "${base}.jpg" 2>/dev/null || true
-    bc $ACTION_SCREENDUMP --ei displayId "$DISPLAY_ID"
-    local i
-    for i in $(seq 1 100); do
-        if [[ -f "${base}.jpg" ]]; then png="${base}.jpg"; break; fi
-        if [[ -f "${base}.png" ]]; then png="${base}.png"; break; fi
-        sleep 0.05
-    done
-    if [[ -n "$png" ]]; then
-        [[ "$png" != "$out" ]] && cp "$png" "$out" 2>/dev/null
-        echo "captura: $out ($(stat -c%s "$out" 2>/dev/null || echo 0) bytes)"
-    else
-        echo "(no se guardo la captura)" >&2
-        [[ -f /sdcard/Download/accessdroid-shot-error.txt ]] && { echo "error del servicio:"; cat /sdcard/Download/accessdroid-shot-error.txt; }
-        return 1
-    fi
+    cp_no_channel
+    return 1
 }
 
 # ---- tocar coordenadas vistas en una captura ----
@@ -1000,25 +855,8 @@ cmd_display() {
         [[ "$CP_CODE" == "ok" ]] && return 0
         return 1
     fi
-
-    # legacy
-    warn_legacy
-    local f=/sdcard/Download/accessdroid-displays.txt
-    rm -f "$f" 2>/dev/null || true
-    if [[ "$op" == "on" ]]; then
-        bc $ACTION_DISPLAY --es op on --ei width "$w" --ei height "$h" --ei density "$dpi" --es flags "$flags"
-    elif [[ "$op" == "off" ]]; then
-        bc $ACTION_DISPLAY --es op off
-    else
-        bc $ACTION_DISPLAY --es op status
-    fi
-    if wait_file "$f" 8; then
-        print_displays < "$f"
-    else
-        echo "(⚠ el servicio no respondió — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2
-        return 1
-    fi
-    return 0
+    cp_no_channel
+    return 1
 }
 
 # ---- ventana flotante (flujo MIUI: recents -> long-press -> menu) ----
@@ -1091,30 +929,8 @@ cmd_enable() {
         cp_report
         return $?
     fi
-    # sin canal rápido: el receptor del manifest responde al broadcast y deja
-    # el resultado en un fichero, que es la única forma de enterarse por aquí.
-    warn_legacy
-    detect_transport
-    local rep="/sdcard/Download/accessdroid-enable.txt"
-    rm -f "$rep" 2>/dev/null || true
-    bc $ACTION_ENABLE_SERVICE
-    if wait_file "$rep" 6; then
-        local txt; txt=$(head -c 300 "$rep" | tr '\n' ' ')
-        echo "informe: $txt"
-        case "$txt" in
-            *WRITE_SECURE_SETTINGS*)
-                echo "→ la app no puede activarse sola (permiso de sistema). Abro Ajustes → Accesibilidad → CostPhone:"
-                am start -a android.settings.ACCESSIBILITY_SETTINGS >/dev/null 2>&1 || \
-                    termux-open "intent:#Intent;action=android.settings.ACCESSIBILITY_SETTINGS;end" >/dev/null 2>&1 || \
-                    echo "   (abre Ajustes → Accesibilidad → CostPhone a mano)"
-                ;;
-            OK*) sleep 1; if cp_port >/dev/null 2>&1; then echo "✓ servicio activo (canal rápido disponible)"; fi ;;
-        esac
-    else
-        echo "sin informe de la app (¿versión < 1.3?) — activa el servicio en"
-        echo "Ajustes → Accesibilidad → CostPhone"
-    fi
-    return 0
+    cp_no_channel
+    return 1
 }
 
 # ========================= batch =========================

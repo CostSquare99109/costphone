@@ -87,7 +87,7 @@ El instalador hace **todo**:
 1. Instala `termux-am` y `python`.
 2. Modifica el **`am` de Termux**: activa `run-termux-am-socket-server` en
    `~/.termux/termux.properties` y agrega `~/bin` al `PATH`.
-3. Copia `amctl` y `amctl-snap.py` a `~/bin`.
+3. Copia `amctl` a `~/bin`.
 4. Instala la skill `phone-control` en `~/.config/opencode/skills/android/`
    como **symlinks por archivo** al repo: la skill del repo y la de OpenCode
    son siempre la misma (nada de copias desactualizadas). Si el filesystem no
