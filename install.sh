@@ -61,8 +61,10 @@ echo "     listo: $BIN/amctl"
 step "4/6  Instalando la skill 'phone-control' para OpenCode..."
 if [ -d "$HOME/.config/opencode" ]; then
     mkdir -p "$SKILL_DIR"
-    cp "$REPO_DIR/skill/phone-control/SKILL.md" "$SKILL_DIR/SKILL.md"
-    echo "     listo: $SKILL_DIR/SKILL.md"
+    # copia TODA la skill (SKILL.md + CHEATSHEET.md + futuros archivos):
+    # el cheat sheet se enlaza por ruta relativa, si falta el link se rompe.
+    cp -r "$REPO_DIR/skill/phone-control/." "$SKILL_DIR/"
+    echo "     listo: $SKILL_DIR/ ($(ls -1 "$SKILL_DIR" | tr '\n' ' '))"
 else
     warn "No hay ~/.config/opencode (¿OpenCode no instalado?) — skill omitida"
 fi
