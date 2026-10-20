@@ -18,6 +18,8 @@
 #             sondeo), así que se avisa.
 #
 # Usage: amctl <command> [args...]
+#   batch    "cmd1; cmd2"       Varias órdenes en UN proceso (1 solo exec)
+#   warmup                     Abre el canal y cachea el puerto (pre-calentar)
 #   list     [query]            List 3rd-party apps
 #   find     <name>             Search apps by package name (shows the real label)
 #   launch   <app|pkg>          Launch an app
@@ -160,11 +162,14 @@ ACTION_ENABLE_SERVICE="com.accessdroid.termux.ACTION_ENABLE_SERVICE"
 
 # ---- flags globales: -d N / --display N  (resto en POSITIONAL) ----
 parse_display() {
+    POSITIONAL=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -d|--display)
                 if [[ -n "${2:-}" ]]; then DISPLAY_ID="$2"; shift 2; continue; fi ;;
-            -d?*) DISPLAY_ID="${1#-d}"; shift; continue ;;
+            # "-d2" pegado, pero solo si NO lleva espacios dentro: si los
+            # lleva es un argumento normal (p.ej. el spec de `batch`).
+            -d?*) [[ "${1#-d}" != *[[:space:]]* ]] && { DISPLAY_ID="${1#-d}"; shift; continue; } ;;
         esac
         POSITIONAL+=("$1"); shift
     done
@@ -1048,6 +1053,19 @@ cmd_float() {
     echo "float: $target -> ventana flotante"
 }
 
+# ---- despertar el canal (pre-calentar) ----
+# Abre el socket, hace un ping y deja el puerto cacheado: la primera orden
+# real ya no paga la búsqueda de puerto.
+cmd_warmup() {
+    CP_ARGS=""
+    if cp_call $ACTION_PING ""; then
+        echo "canal listo: $CP_HOST:$CP_PORT (${CP_TEXT:-pong})"
+        return 0
+    fi
+    echo "canal rápido: NO disponible" >&2
+    return 1
+}
+
 # ---- diagnóstico del canal ----
 cmd_status() {
     CP_ARGS=""
@@ -1099,10 +1117,75 @@ cmd_enable() {
     return 0
 }
 
-# ========================= dispatcher =========================
-parse_display "$@"
-set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+# ========================= batch =========================
+# Ejecuta N órdenes en UN solo proceso (un solo exec de bash, una sola
+# carga del script). Antes: "amctl a; amctl b; amctl c" = 3 execs de bash
+# = ~450 ms solo de arranque, antes de que la primera orden salga.
+#
+#   amctl batch "launch com.whatsapp; waitfor Chats 8000; snap --filter chat"
+#
+BATCH_ARGV=()
+batch_split() {
+    local s="$1"
+    local i=0 n cur="" q="" ch
+    n=${#s}
+    BATCH_ARGV=()
+    while (( i < n )); do
+        ch="${s:i:1}"
+        if [[ -n "$q" ]]; then
+            if [[ "$ch" == "$q" ]]; then q=""; else cur+="$ch"; fi
+        elif [[ "$ch" == "'" || "$ch" == '"' ]]; then
+            q="$ch"
+        elif [[ "$ch" == " " || "$ch" == $'\t' ]]; then
+            if [[ -n "$cur" ]]; then BATCH_ARGV+=("$cur"); cur=""; fi
+        else
+            cur+="$ch"
+        fi
+        (( i++ ))
+    done
+    [[ -n "$cur" ]] && BATCH_ARGV+=("$cur")
+    return 0
+}
 
+cmd_batch() {
+    local spec="$*"
+    [[ -z "${spec//[[:space:]]/}" ]] && { echo "uso: amctl batch \"cmd1; cmd2; ...\"" >&2; return 2; }
+    local -a items=()
+    local part
+    local IFS=';'
+    # parte por ';' (sin romper los espacios de cada orden)
+    local cur=""
+    local i=0 ch
+    for (( i=0; i<${#spec}; i++ )); do
+        ch="${spec:i:1}"
+        if [[ "$ch" == ";" ]]; then items+=("$cur"); cur=""; else cur+="$ch"; fi
+    done
+    items+=("$cur")
+    unset IFS
+
+    local outer_disp="$DISPLAY_ID"
+    local it rc=0 first=1
+    for it in "${items[@]}"; do
+        # recorta espacios
+        it="${it#"${it%%[![:space:]]*}"}"
+        it="${it%"${it##*[![:space:]]}"}"
+        [[ -z "$it" ]] && continue
+        batch_split "$it"
+        [[ ${#BATCH_ARGV[@]} -eq 0 ]] && continue
+        DISPLAY_ID="$outer_disp"
+        local -a av=("${BATCH_ARGV[@]}")
+        parse_display "${av[@]}"
+        av=(${POSITIONAL[@]+"${POSITIONAL[@]}"})
+        [[ ${#av[@]} -eq 0 ]] && continue
+        if [[ $first -eq 0 ]]; then echo "---"; fi
+        first=0
+        amctl_run "${av[@]}" || rc=1
+    done
+    return $rc
+}
+
+# ========================= dispatcher =========================
+amctl_run() {
 case "${1:-help}" in
     list)      cmd_list "${2:-}" ;;
     find)      cmd_find "${2:-}" ;;
@@ -1141,9 +1224,16 @@ case "${1:-help}" in
     presskey)  cmd_presskey "${2:-}" ;;
     display)   shift; cmd_display "$@" ;;
     displays)  cmd_display status ;;
+    batch)     shift; cmd_batch "$@" ;;
+    warmup)    cmd_warmup ;;
     status)    cmd_status ;;
     enable)    cmd_enable ;;
     help|-h|--help)
         awk '/^#====/{c++; if(c==2) exit} c>=1{print}' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) echo "unknown command: $1 (use 'amctl help')" >&2; exit 1 ;;
+    *) echo "unknown command: $1 (use 'amctl help')" >&2; return 1 ;;
 esac
+}
+
+parse_display "$@"
+set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+amctl_run "$@"
