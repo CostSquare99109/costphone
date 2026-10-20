@@ -5,10 +5,8 @@ import android.accessibilityservice.AccessibilityServiceInfo;
 import android.accessibilityservice.AccessibilityService.ScreenshotResult;
 import android.accessibilityservice.AccessibilityService.TakeScreenshotCallback;
 import android.accessibilityservice.GestureDescription;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.os.Build;
@@ -28,9 +26,6 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
 
 public class AccessibilityServiceImpl extends AccessibilityService {
 
@@ -72,6 +67,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     private static final String ACTION_TAPREF = "com.accessdroid.termux.ACTION_TAPREF";
     private static final String ACTION_WAITFOR = "com.accessdroid.termux.ACTION_WAITFOR";
     public static final String ACTION_ENABLE_SERVICE = "com.accessdroid.termux.ACTION_ENABLE_SERVICE";
+    private static final String ACTION_RESOLVE_PKG = "com.accessdroid.termux.ACTION_RESOLVE_PKG";
     private static final String ACTION_PING = "com.accessdroid.termux.ACTION_PING";
 
     /** Pantalla virtual (display secundario). */
@@ -95,22 +91,12 @@ public class AccessibilityServiceImpl extends AccessibilityService {
 
     static AccessibilityServiceImpl sInstance;
     int screenW, screenH;
-    BroadcastReceiver receiver;
     Handler handler = new Handler(Looper.getMainLooper());
     // Shared secret – set via build-time constant or default. amctl must send it.
     public static final String SECRET = "termux-accessdroid-2025";
     // Screenshot callback state
     interface ScreenshotCB { void onResult(android.graphics.Bitmap bmp); }
     ScreenshotCB pendingCb = null;
-
-    /** Trabajo pesado fuera del hilo principal (nada de bloqueos en onReceive). */
-    private final ExecutorService worker = Executors.newFixedThreadPool(3, new ThreadFactory() {
-        @Override public Thread newThread(Runnable r) {
-            Thread t = new Thread(r, "cp-worker");
-            t.setDaemon(true);
-            return t;
-        }
-    });
 
     /** Canal rápido por TCP loopback. */
     private CpServer server;
@@ -178,25 +164,6 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             : "accessdroid-tree-d" + displayId + ".txt";
     }
 
-    /* Save a file to the public Downloads collection (no storage permission needed). */
-    private void saveToDownloads(String name, String mime, byte[] data) {
-        try {
-            android.content.ContentValues cv = new android.content.ContentValues();
-            cv.put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name);
-            cv.put(android.provider.MediaStore.Downloads.MIME_TYPE, mime);
-            cv.put(android.provider.MediaStore.Downloads.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS);
-            try {
-                getContentResolver().delete(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                    android.provider.MediaStore.Downloads.DISPLAY_NAME + "=?", new String[]{name});
-            } catch (Exception ignored) { }
-            android.net.Uri uri = getContentResolver().insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
-            if (uri == null) { Log.w(TAG, "saveToDownloads: insert failed for " + name); return; }
-            java.io.OutputStream os = getContentResolver().openOutputStream(uri);
-            if (os != null) { os.write(data); os.close(); }
-            Log.i(TAG, "saved Download/" + name + " (" + data.length + " bytes)");
-        } catch (Exception e) { Log.w(TAG, "saveToDownloads fail: " + name, e); }
-    }
-
     @Override
     public void onServiceConnected() {
         super.onServiceConnected();
@@ -206,8 +173,9 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         screenH = dm.heightPixels;
 
         // Canal rápido: la app sirve las órdenes por TCP de loopback y el CLI
-        // las manda por ahí. Si esto falla, todo sigue funcionando por
-        // broadcast (más lento) — el CLI lo detecta y cae al canal viejo.
+        // las manda por ahí. Si esto falla, el CLI lo dice claro y no hay
+        // alternativa: el canal legacy (broadcast + fichero) se eliminó en
+        // la v1.4 porque costaba 1-5 s por orden y hacía fallar en silencio.
         try {
             server = new CpServer(SECRET, new CpServer.Handler() {
                 @Override public CpRes handle(String action, Map<String, Object> args) {
@@ -218,54 +186,6 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         } catch (Throwable t) {
             Log.w(TAG, "no se pudo abrir el canal rápido", t);
         }
-
-        receiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                // goAsync() vive en el receptor: el trabajo pesado sigue vivo
-                // fuera de onReceive sin bloquear el hilo principal.
-                final BroadcastReceiver.PendingResult pending = goAsync();
-                handleBroadcast(intent, pending);
-            }
-        };
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(ACTION_TAP);
-        filter.addAction(ACTION_SWIPE);
-        filter.addAction(ACTION_LONG_PRESS);
-        filter.addAction(ACTION_SCROLL_UP);
-        filter.addAction(ACTION_SCROLL_DOWN);
-        filter.addAction(ACTION_BACK);
-        filter.addAction(ACTION_HOME);
-        filter.addAction(ACTION_RECENTS);
-        filter.addAction(ACTION_TYPE);
-        filter.addAction(ACTION_CLICK_TEXT);
-        filter.addAction(ACTION_CLICK_ID);
-        filter.addAction(ACTION_FIND_ID);
-        filter.addAction(ACTION_SCROLL_TO);
-        filter.addAction(ACTION_PRESS_KEY);
-        filter.addAction(ACTION_SCREENDUMP);
-        filter.addAction(ACTION_GET_UI_TREE);
-        filter.addAction(ACTION_PINCH);
-        filter.addAction(ACTION_DOUBLE_TAP);
-        filter.addAction(ACTION_CLEAR_TEXT);
-        filter.addAction(ACTION_PASTE);
-        filter.addAction(ACTION_FOCUS);
-        filter.addAction(ACTION_NOTIFICATIONS);
-        filter.addAction(ACTION_QUICK_SETTINGS);
-        filter.addAction(ACTION_LOCK);
-        filter.addAction(ACTION_SCREENSHOT);
-        filter.addAction(ACTION_OPEN_SETTINGS);
-        filter.addAction(ACTION_START_ACTIVITY);
-        filter.addAction(ACTION_OPEN_URI);
-        filter.addAction(ACTION_POWER);
-        filter.addAction(ACTION_DISPLAY);
-        filter.addAction(ACTION_DISPLAY_BACK);
-        filter.addAction(ACTION_GET_SNAPSHOT);
-        filter.addAction(ACTION_TAPREF);
-        filter.addAction(ACTION_WAITFOR);
-        filter.addAction(ACTION_ENABLE_SERVICE);
-        filter.addAction(ACTION_PING);
-        registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
         Log.i(TAG, "AccessibilityService connected – ready");
     }
 
@@ -298,11 +218,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     @Override
     public void onDestroy() {
         super.onDestroy();
-        if (receiver != null) {
-            try { unregisterReceiver(receiver); } catch (Exception e) { }
-        }
         if (server != null) { try { server.stop(); } catch (Exception ignored) { } server = null; }
-        try { worker.shutdownNow(); } catch (Exception ignored) { }
         sInstance = null;
     }
 
@@ -310,52 +226,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     /*                        Command dispatcher                      */
     /* -------------------------------------------------------------- */
 
-    /**
-     * Canal legacy (broadcast): valida el secreto y ejecuta la orden fuera del
-     * hilo principal. El receptor tiene 10s de vida: el trabajo se hace en un
-     * hilo aparte y goAsync() mantiene vivo el receptor hasta terminar.
-     */
-    private void handleBroadcast(Intent intent, final BroadcastReceiver.PendingResult pending) {
-        String action = intent.getAction();
-        if (action == null) { if (pending != null) pending.finish(); return; }
-        String secret = intent.getStringExtra("secret");
-        if (secret == null || !secret.equals(SECRET)) {
-            Log.w(TAG, "rejected command with bad/missing secret: " + action);
-            if (pending != null) pending.finish();
-            return;
-        }
-        Log.d(TAG, "cmd: " + action);
-        worker.execute(new Runnable() {
-            @Override public void run() {
-                CpRes res;
-                try {
-                    res = execute(intent);
-                } catch (Throwable t) {
-                    Log.w(TAG, "orden fallida", t);
-                    res = CpRes.fail("error: " + t);
-                }
-                try { persist(res); } catch (Throwable ignored) { }
-                try { if (pending != null) pending.finish(); } catch (Throwable ignored) { }
-            }
-        });
-    }
-
-    /** Guarda la carga en /sdcard/Download (solo lo necesita el canal legacy). */
-    private void persist(CpRes res) {
-        if (res == null || res.fileName == null) return;
-        try {
-            if (res.binary && res.payload != null) {
-                saveToDownloads(res.fileName, res.mime, res.payload);
-            } else if (res.text != null) {
-                saveToDownloads(res.fileName, res.mime, res.text.getBytes("UTF-8"));
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "persist fail: " + res.fileName, e);
-        }
-    }
-
-    /** Traduce los argumentos del canal rápido a extras de Intent y ejecuta. */
-    private CpRes executeFromArgs(String action, Map<String, Object> args) {
+    /** Traduce los argumentos del canal rápido a extras de Intent y ejecuta. */    private CpRes executeFromArgs(String action, Map<String, Object> args) {
         // El cliente puede mandar el nombre corto ("ACTION_TAP") o el completo
         // ("com.accessdroid.termux.ACTION_TAP"). Antes se prefijaba siempre y
         // el nombre completo acababa duplicado ("com.accessdroid.termux.com...").
@@ -379,6 +250,14 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         if (action == null) return CpRes.fail("sin acción");
 
         switch (action) {
+            case ACTION_RESOLVE_PKG: {
+                // Resolver el nombre de una app ("whatsapp" -> "com.whatsapp")
+                // desde el propio servicio: el CLI no depende así del socket de
+                // Termux:API (que además no siempre está disponible).
+                String q = intent.getStringExtra("query");
+                if (q == null || q.isEmpty()) return CpRes.fail("consulta vacía");
+                return resolvePackage(q);
+            }
             case ACTION_ENABLE_SERVICE:
                 return enableSelf(this);
             case ACTION_PING:
@@ -439,6 +318,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             case ACTION_TYPE: {
                 String text = intent.getStringExtra("text");
                 if (text == null || text.isEmpty()) return CpRes.fail("texto vacío");
+                long settle = intent.getLongExtra("settle", 400);
                 AccessibilityNodeInfo focus = focusIn(disp(intent));
                 if (focus != null) {
                     Bundle args = new Bundle();
@@ -447,9 +327,19 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                     // setText puede devolver true y no escribir nada (combobox,
                     // inputs React/web): hay que comprobar el texto de verdad.
                     if (ok) {
-                        nap(150);
-                        // nodo fresco: el anterior ya está obsoleto y devuelve el texto viejo
-                        if (textLanded(focusIn(disp(intent)), text)) return CpRes.ok("escrito: " + text);
+                        // El setText es síncrono, pero el nodo puede tardar un
+                        // poco en reflejarlo. Antes había una espera FIJA de
+                        // 150 ms en cada escritura; ahora se comprueba primero
+                        // (caso normal: ya está escrito) y solo se espera si
+                        // hace falta, en fracciones cortas.
+                        long deadline = System.currentTimeMillis() + Math.max(0, Math.min(settle, 2000));
+                        while (true) {
+                            // nodo fresco: el anterior ya está obsoleto y
+                            // devuelve el texto viejo
+                            if (textLanded(focusIn(disp(intent)), text)) return CpRes.ok("escrito: " + text);
+                            if (System.currentTimeMillis() >= deadline) break;
+                            nap(30);
+                        }
                         if (typeWithIme(text, disp(intent)) && textLanded(focusIn(disp(intent)), text))
                             return CpRes.ok("escrito (teclado): " + text);
                         return CpRes.fail("el campo aceptó el texto pero no lo muestra: "
@@ -549,7 +439,8 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             case ACTION_TAPREF: {
                 String ref = intent.getStringExtra("ref");
                 if (ref == null || ref.isEmpty()) return CpRes.fail("ref vacío");
-                return tapRef(ref, disp(intent));
+                long settle = intent.getLongExtra("settle", 0);
+                return tapRef(ref, disp(intent), settle);
             }
             case ACTION_WAITFOR: {
                 // Espera a que aparezca un elemento: el bucle va en el servicio,
@@ -972,7 +863,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
      * busca el elemento equivalente en el árbol actual; si ya no existe, se
      * avisa en vez de tocar una posición equivocada.
      */
-    private CpRes tapRef(String ref, int displayId) {
+    private CpRes tapRef(String ref, int displayId, long settleMs) {
         if (ref.startsWith("@")) ref = ref.substring(1);
         if (!ref.startsWith("p")) ref = "p" + ref;
         RefCache cache = refCache;
@@ -1013,7 +904,12 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         }
 
         run(makeTap(x, y, 80L, displayId), "tapref");
-        return CpRes.ok("tap @" + ref + " -> (" + x + "," + y + ")" + (resolved ? " [re-resuelto]" : ""));
+        // El "settle" se duerme AQUI, no en el cliente: si el CLI tuviera que
+        // dormir, pagaría un exec de 'sleep' (~150 ms en un teléfono).
+        if (settleMs > 0) nap(Math.min(settleMs, 3000));
+        return CpRes.ok("tap @" + ref + " -> (" + x + "," + y + ")"
+                + (resolved ? " [re-resuelto]" : "")
+                + (settleMs > 0 ? " [settled " + settleMs + "]" : ""));
     }
 
     /** Busca en los elementos frescos el equivalente al de la ref. */
@@ -1117,6 +1013,80 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             }
         } catch (Exception e) { /* sin dimensiones */ }
         return "?";
+    }
+
+    /* -------------------------------------------------------------- */
+    /*                    Resolver nombre de app                     */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Convierte un nombre en un paquete: "whatsapp" -> "com.whatsapp".
+     *
+     * Busca primero coincidencia exacta del paquete, luego por etiqueta
+     * (el nombre que ve el usuario: "WhatsApp") y por último por
+     * subcadena del paquete. Si hay varias, las devuelve todas para que el
+     * agente elija.
+     */
+    private CpRes resolvePackage(String query) {
+        String q = query.trim();
+        if (q.isEmpty()) return CpRes.fail("consulta vacía");
+        String ql = q.toLowerCase();
+        android.content.pm.PackageManager pm = getPackageManager();
+        if (pm == null) return CpRes.fail("no hay PackageManager");
+        List<android.content.pm.ApplicationInfo> apps;
+        try {
+            apps = pm.getInstalledApplications(0);
+        } catch (Exception e) {
+            return CpRes.fail("no se pudieron listar las apps: " + e);
+        }
+        // 1) paquete exacto
+        for (android.content.pm.ApplicationInfo ai : apps) {
+            if (ai.packageName.equals(q)) return CpRes.ok(ai.packageName);
+        }
+        // 2) etiqueta exacta (case-insensitive)
+        List<String> byLabel = new ArrayList<>();
+        for (android.content.pm.ApplicationInfo ai : apps) {
+            String label = labelOf(pm, ai);
+            if (label != null && label.toLowerCase().equals(ql)) byLabel.add(ai.packageName);
+        }
+        if (byLabel.size() == 1) return CpRes.ok(byLabel.get(0));
+        // 3) subcadena de la etiqueta
+        List<String> fuzzy = new ArrayList<>();
+        for (android.content.pm.ApplicationInfo ai : apps) {
+            String label = labelOf(pm, ai);
+            if (label != null && label.toLowerCase().contains(ql)) fuzzy.add(ai.packageName);
+        }
+        if (fuzzy.size() == 1) return CpRes.ok(fuzzy.get(0));
+        if (fuzzy.size() > 1) {
+            StringBuilder sb = new StringBuilder();
+            for (String p : fuzzy) { if (sb.length() > 0) sb.append(' '); sb.append(p); }
+            return CpRes.fail("'" + q + "' coincide con varias: " + sb);
+        }
+        // 4) subcadena del paquete
+        List<String> byPkg = new ArrayList<>();
+        for (android.content.pm.ApplicationInfo ai : apps) {
+            if (ai.packageName.toLowerCase().contains(ql)) byPkg.add(ai.packageName);
+        }
+        if (byPkg.size() == 1) return CpRes.ok(byPkg.get(0));
+        if (byPkg.size() > 1) {
+            StringBuilder sb = new StringBuilder();
+            for (String p : byPkg) { if (sb.length() > 0) sb.append(' '); sb.append(p); }
+            return CpRes.fail("'" + q + "' coincide con varios paquetes: " + sb);
+        }
+        return CpRes.fail("no hay ninguna app que sea '" + q + "'");
+    }
+
+    /** Etiqueta visible de una app (o null si no se puede leer). */
+    private String labelOf(android.content.pm.PackageManager pm,
+                           android.content.pm.ApplicationInfo ai) {
+        try {
+            CharSequence cs = pm.getApplicationLabel(ai);
+            if (cs != null) {
+                String s = cs.toString().trim();
+                if (!s.isEmpty()) return s;
+            }
+        } catch (Exception ignored) { }
+        return null;
     }
 
     /* -------------------------------------------------------------- */

@@ -41,6 +41,7 @@
 #   scroll   up|down [x y]      Scroll at position
 #   back / home / recents       Botones del sistema
 #   type     <text>             Type text into the focused field (REPLACES it)
+#   type     <text> [ms]        ... con un plazo de espera (por defecto 400)
 #   cleartext                   Clear the focused text field
 #   paste                       Paste clipboard into the focused field
 #   focus     [text|id]         Focus a field by text or resource-id
@@ -159,6 +160,7 @@ ACTION_TAPREF="com.accessdroid.termux.ACTION_TAPREF"
 ACTION_WAITFOR="com.accessdroid.termux.ACTION_WAITFOR"
 ACTION_PING="com.accessdroid.termux.ACTION_PING"
 ACTION_ENABLE_SERVICE="com.accessdroid.termux.ACTION_ENABLE_SERVICE"
+ACTION_RESOLVE_PKG="com.accessdroid.termux.ACTION_RESOLVE_PKG"
 
 # ---- flags globales: -d N / --display N  (resto en POSITIONAL) ----
 parse_display() {
@@ -400,17 +402,30 @@ cmd_find() {
 }
 
 # ---- package resolution (substring match -> unique package) ----
-# Caché de la lista de paquetes: `pm list packages` + sed + awk + grep eran
-# 5 execs (~800 ms). Ahora se cachea y el filtrado es puro bash.
+# El propio servicio sabe resolver nombres ("whatsapp" -> "com.whatsapp"):
+# se le pregunta primero, que es instantáneo y no depende del socket de
+# Termux:API. Solo si la app es vieja (no conoce la orden) se recurre a
+# 'pm list packages' (con caché).
 resolve_pkg() {
     local input="$1"
     [[ -z "$input" ]] && { echo "missing app/package argument" >&2; return 2; }
+    # 1) el servicio (rápido, sin dependencias)
+    CP_ARGS=""
+    cp_arg s query "$input"
+    if cp_call $ACTION_RESOLVE_PKG "$(cp_encode_args)"; then
+        if [[ "$CP_CODE" == "ok" && -n "$CP_TEXT" ]]; then
+            printf '%s\n' "$CP_TEXT"
+            return 0
+        fi
+        # la app es vieja o no sabe: se cae al método local
+    fi
+    # 2) 'pm list packages' con caché de 5 minutos
     detect_transport
     if [[ "$TRANSPORT" != "socket" ]]; then
         if [[ "$input" == *.* ]]; then
             echo "$input"; return 0
         fi
-        echo "sin AM socket no hay busqueda por nombre: usa el package name completo (ej: com.android.chrome)" >&2
+        echo "no hay canal rápido ni Termux:API: usa el nombre completo del paquete (ej: com.android.chrome)" >&2
         return 1
     fi
     local cachef="$CACHE/pkgs.tsv" now ts
@@ -424,7 +439,7 @@ resolve_pkg() {
         local raw
         raw=$(tam pm list packages 2>/dev/null) || raw=""
         if [[ -z "$raw" ]]; then
-            echo "no se pudo listar los paquetes (¿Termux:API?)" >&2; return 1
+            echo "no se pudo resolver '$input' (¿app v1.4+ o Termux:API?)" >&2; return 1
         fi
         cp_cache_ensure
         { printf '%s\n' "$now"; printf '%s\n' "$raw"; } > "$cachef" 2>/dev/null || true
@@ -592,7 +607,7 @@ cmd_scroll()     { local dir="${1:-down}"; if [[ "$dir" == "down" ]]; then cp_or
 cmd_back()       { cp_or_bc $ACTION_BACK $ACTION_BACK; }
 cmd_home()       { cp_or_bc $ACTION_HOME $ACTION_HOME; }
 cmd_recents()    { cp_or_bc $ACTION_RECENTS $ACTION_RECENTS; }
-cmd_type()       { cp_or_bc $ACTION_TYPE $ACTION_TYPE "s:text=${1:-}"; }
+cmd_type()       { cp_or_bc $ACTION_TYPE $ACTION_TYPE "s:text=${1:-}" "l:settle=${2:-400}"; }
 cmd_cleartext()  { cp_or_bc $ACTION_CLEAR_TEXT $ACTION_CLEAR_TEXT; }
 cmd_paste()      { cp_or_bc $ACTION_PASTE $ACTION_PASTE; }
 cmd_focus()      { local t="${1:-}"; if [[ -n "$t" ]]; then cp_or_bc $ACTION_FOCUS $ACTION_FOCUS "s:text=$t"; else cp_or_bc $ACTION_FOCUS $ACTION_FOCUS; fi; }
@@ -1024,7 +1039,7 @@ case "${1:-help}" in
     home)      cmd_home ;;
     recents)   cmd_recents ;;
     float)     cmd_float "${2:-}" "${3:-}" "${4:-}" ;;
-    type)      cmd_type "${2:-}" ;;
+    type)      cmd_type "${2:-}" "${3:-400}" ;;
     cleartext) cmd_cleartext ;;
     paste)     cmd_paste ;;
     focus)     cmd_focus "${2:-}" ;;
