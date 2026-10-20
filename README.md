@@ -44,18 +44,40 @@ El canal rápido es la diferencia entre esto y esto:
 
 | | Antes (broadcast + fichero) | Ahora (socket local) |
 |---|---|---|
-| `amctl snap` | 3.5-9 s | **0.6-0.9 s** |
-| `amctl tap` / `type` / `click` | 1-5 s (y sin confirmar) | **0.4-1.3 s** (y con estado) |
-| `amctl see` | 2-5 s (PNG de 500 KB) | **0.9-1.3 s** (JPEG) |
-| `amctl waitfor` | depende del `sleep` | **0.8-2.4 s** (espera real) |
-| `amctl status` | ~4 s | **0.6-0.8 s** |
+| `amctl snap` | 3.5-9 s | **0.22 s** |
+| `amctl tap` / `type` / `click` | 1-5 s (y sin confirmar) | **0.15-0.24 s** (y con estado) |
+| `amctl see` | 2-5 s (PNG de 500 KB) | **0.7 s** (JPEG) |
+| `amctl waitfor` | depende del `sleep` | **lo que tarde el elemento** |
+| `amctl status` | ~4 s | **0.25 s** |
 
-Medido en el dispositivo de referencia (Android 16, MIUI/HyperOS).
+Medido en el dispositivo de referencia (Android 16, MIUI/HyperOS), p50 de 10
+iteraciones. La auditoría completa está en **[SPEED_AUDIT.md](SPEED_AUDIT.md)**.
+
+### 🏎️ `cp.sh`: el camino sin un solo `exec`
+
+En un teléfono, **cada `exec` de un binario cuesta ~150 ms** (el enlazador
+dinámico de Android no es trivial). Como `amctl` es un script de bash,
+lanzarlo paga ese exec. La librería `cp.sh` habla el mismo protocolo **sin
+lanzar ningún proceso** (solo builtins de bash contra `/dev/tcp`):
+
+```bash
+. ~/.config/opencode/skills/android/phone-control/cp.sh && cp_snap --filter chat
+```
+
+| | `amctl` | `cp.sh` |
+|---|---|---|
+| `status` | 254 ms | **14 ms** |
+| `snap` | 224 ms | **89 ms** |
 
 Además:
 
 - El snapshot **lo calcula el servicio** (no el CLI): sin descarga de árbol, sin
   fichero intermedio y sin arrancar Python (~0.6 s) para parsearlo.
+- Las etiquetas del snapshot se calculan en **O(n)** (antes O(n²)): con
+  pantallas densas el snapshot ya no se arrastra.
+- El árbol de accesibilidad se **cachea** mientras la UI no cambie: el flujo
+  `launch → waitfor → snap` lo recorre una sola vez.
+- `amctl batch "a; b; c"` ejecuta N órdenes en **un** proceso.
 - El trabajo pesado (volcar el árbol, escribir ficheros) sale del hilo
   principal del servicio: la app deja deerse congarse y de hacer *ANR*.
 - `amctl waitfor "texto"` espera **dentro** del servicio: el agente no duerme
@@ -64,8 +86,7 @@ Además:
 - La captura es JPEG (10x más rápido de comprimir y de transferir que PNG).
 - `amctl enable` **re-activa el servicio solo** tras una actualización
   (Android lo desactiva por seguridad): la app tiene `WRITE_SECURE_SETTINGS`
-  concedido y se auto-activa. Si algún día no lo tuviera, el comando abre
-  directamente la pantalla de Accesibilidad.
+  concedido y se auto-activa.
 
 ## Requisitos
 
@@ -119,6 +140,9 @@ amctl see      # captura JPEG -> /sdcard/Download/accessdroid-shot.jpg
 | Navegar a una URL (sin omnibox) | `amctl openurl https://…` |
 | Captura JPEG (PNG con `--png`) | `amctl see` |
 | Lanzar app | `amctl launch com.whatsapp` |
+| Lanzar app por nombre | `amctl launch whatsapp` (lo resuelve la app) |
+| Varias órdenes en un proceso | `amctl batch "home; back; snap --filter chat"` |
+| Pre-calentar el canal | `amctl warmup` |
 | Escribir en el campo enfocado (reemplaza) | `amctl type "hola mundo"` |
 | Vaciar el campo enfocado | `amctl cleartext` |
 | Pegar clipboard en el campo | `amctl paste` |
@@ -208,6 +232,22 @@ la pantalla 0) y la bitácora de cómo se descubrió esto:
 (OpenCode, Claude, etc.) sepa operar el teléfono con este toolkit: el loop de
 snapshot/tap, cómo leer el árbol, troubleshooting, etc. `install.sh` la deja
 en el lugar correcto y la registra en `AGENTS.md` automáticamente.
+
+Además incluye dos piezas pensadas para la latencia:
+
+- **`CHEATSHEET.md`** — la referencia de 1 página (regla de oro, anti-patrones,
+  bucle central).
+- **`cp.sh`** — la librería del canal rápido en bash puro. Un agente que la
+  cargue (`source`) habla con el teléfono **sin lanzar ningún proceso**, que en
+  un teléfono vale ~150 ms por orden. Es el mismo protocolo y la misma salida
+  que `amctl`.
+
+```bash
+. ~/.config/opencode/skills/android/phone-control/cp.sh && cp_snap --filter chat
+```
+
+La auditoría de velocidad (mediciones, hallazgos y cambios) está en
+**[SPEED_AUDIT.md](SPEED_AUDIT.md)**.
 
 ## Compilar el APK tú mismo
 
