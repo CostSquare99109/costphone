@@ -11,11 +11,39 @@ Equivalente móvil de agent-browser. El CLI es `amctl` (~/bin/amctl), que habla
 con el servicio de accesibilidad CostPhone (com.accessdroid.termux).
 
 > ## ⚡ REGLA DE ORO
-> Todo va por socket local: **cada orden cuesta 0.4-1.5s y te dice si
+> Todo va por socket local: **cada orden cuesta 0.15-0.3s y te dice si
 > funcionó**. No hay modo lento. Si una orden te está tardando 3-9s, el
 > problema no es la orden: es que estás usando un patrón lento
 > (`sleep`, `head -40`, `launch` + espera, un tool-call por acción).
 > Mira los anti-patrones de abajo antes de seguir.
+
+## 🏎️ EL CAMINO MÁS RÁPIDO: `cp.sh` (0 execs)
+
+En un teléfono **cada `exec` de un binario cuesta ~150 ms** (el enlazador
+dinámico de Android no es trivial). `amctl` es un script de bash, así que
+cada invocación paga ese exec. La librería `cp.sh` habla el mismo protocolo
+**sin lanzar ningún proceso** (solo builtins de bash contra `/dev/tcp`):
+
+```bash
+. ~/.config/opencode/skills/android/phone-control/cp.sh && cp_snap --filter chat
+```
+
+| | `amctl` | `cp.sh` |
+|---|---|---|
+| `status` | 254 ms | **14 ms** |
+| `snap` | 224 ms | **89 ms** |
+| varias órdenes | `amctl a; amctl b` | `cp_batch "a; b"` |
+
+Ordenes disponibles: `cp_snap [--filter T] [-a]`, `cp_tap X Y`,
+`cp_swipe X1 Y1 X2 Y2 [ms]`, `cp_scroll up|down`, `cp_back`, `cp_home`,
+`cp_recents`, `cp_click "texto"`, `cp_clickid id`, `cp_tapref @pN`,
+`cp_type "texto"`, `cp_cleartext`, `cp_paste`, `cp_waitfor "texto" [ms]`,
+`cp_launch pkg`, `cp_openurl url [pkg]`, `cp_see [fichero]`,
+`cp_batch "cmd1; cmd2"`, `cp_status`.
+
+Salida **idéntica** a `amctl` (mismo formato `@pN [Clase] 'texto' #id (x,y)`).
+`amctl` sigue siendo la interfaz completa (`help`, `ocr`, `display`, `float`,
+`list`, `find`).
 
 ## ⚡ Velocidad: las tres reglas que más ahorran tiempo
 
@@ -25,26 +53,29 @@ con el servicio de accesibilidad CostPhone (com.accessdroid.termux).
    amctl launch com.whatsapp; amctl waitfor "Preguntar a Meta AI" 8000; amctl snap
    ```
    Tres comandos, una llamada, una respuesta al modelo.
+   Y si usas `cp.sh`: `cp_batch "launch com.whatsapp; waitfor 'Preguntar a Meta AI' 8000; snap"`.
 2. **Nada de `sleep` a ciegas.** `amctl waitfor "texto" [ms]` espera dentro del
    servicio y vuelve en cuanto aparece (o avisa al expirar). Es 5-10x más
    rápido que `sleep 6` + `snap` de prueba.
 3. **Prefiere `click`/`clickid` a `snap`+`tapref` cuando tengas el id.** Un
-   click por id es una orden (0.4-1.3s); el ciclo snapshot+tap son dos y además
+   click por id es una orden (0.2-0.3s); el ciclo snapshot+tap son dos y además
    hay que re-snapshotar después.
 
-Tiempos **medidos** en el dispositivo de referencia (Android 16).
+Tiempos **medidos** en el dispositivo de referencia (Android 16, 10
+iteraciones, p50).
 
 | Orden | Coste real | Notas |
 |---|---|---|
-| `tap`, `longpress`, `swipe`, `scroll`, `back`, `home`, `recents` | 0.4-0.6s | vuelan y no devuelven nada que leer |
-| `click "texto"`, `clickid <id>`, `type`, `focus`, `paste` | 0.4-1.3s | el servicio confirma si funcionó |
-| `snap`, `tree` | 0.5-0.9s | vuelca la pantalla; usa `--filter` si hay mucho |
-| `tapref` | 0.5-1.4s | re-resuelve la ref en el servidor (evita el toque en sitio equivocado) |
-| `see` (captura) | 0.9-1.3s | solo si de verdad necesitas la imagen |
-| `launch` | 0.6-0.9s | |
-| `waitfor` | lo que tarde el elemento (0.6-2.4s) | mejor que cualquier `sleep` |
+| `tap`, `longpress`, `swipe`, `scroll`, `back`, `home`, `recents` | 0.15-0.3s | vuelan y no devuelven nada que leer |
+| `click "texto"`, `clickid <id>`, `type`, `focus`, `paste` | 0.2-0.3s | el servicio confirma si funcionó |
+| `snap`, `tree` | 0.22-0.27s | vuelca la pantalla; usa `--filter` si hay mucho |
+| `tapref` | 0.2-0.3s | re-resuelve la ref en el servidor (evita el toque en sitio equivocado) |
+| `see` (captura) | 0.7s | solo si de verdad necesitas la imagen |
+| `launch` | 0.29s | por nombre: `launch whatsapp` (lo resuelve la app) |
+| `waitfor` | lo que tarde el elemento | mejor que cualquier `sleep` |
+| `batch "a; b; c"` | ~0.15s **por orden** | un solo proceso para todas |
 
-Regla práctica: **el coste real de una orden es ~0.5-1.5s**, así que lo que
+Regla práctica: **el coste real de una orden es ~0.2-0.3s**, así que lo que
 manda es el número de tool-calls, no el tiempo dentro de cada orden.
 
 ### ❌ Anti-patrones (los que se comen el tiempo)
@@ -55,9 +86,9 @@ manda es el número de tool-calls, no el tiempo dentro de cada orden.
 | `amctl snap \| head -40` | `amctl snap --filter "lo que buscas"` + `head -8` | 40 líneas de ruido = 40 líneas de contexto para nada |
 | `amctl launch com.android.chrome` y luego buscar la URL | `amctl openurl "https://…"` | Chrome **restaura la sesión anterior** (te deja en otra página) y además hay que pelear con el omnibox |
 | `snap` → `tapref` → `snap` → `tapref` | `clickid <id>` o `click "texto"` cuando el id se sepa | dos órdenes y dos tool-calls por acción |
-| un `amctl` por tool-call | `amctl a; amctl b; amctl c` en una sola llamada | cada tool-call cuesta ida y vuelta |
-| `sleep 3` "por si acaso" entre dos acciones | `amctl tapref @pN --settle 500` | espera real, no adivinada |
-| `waitfor "<título>"` justo después de abrir un video | `snap --filter "minutos"` y mira la **duración** | el overlay del reproductor se oculta a los ~3 s: el `waitfor` del título expira aunque el video esté cargado. Duración ≤60 s = es el anuncio; la duración real es la prueba |
+| un `amctl` por tool-call | `amctl batch "a; b; c"` en una sola llamada | un solo proceso en vez de N |
+| `amctl` en un bucle | `. cp.sh && cp_*` | 0 execs: 254 ms → 14 ms |
+| `sleep 3` "por si acaso" entre dos acciones | `amctl tapref @pN --settle 500` | espera real, no adivinada (y la duerme el servidor) |
 
 **Antes de la primera orden de cada tarea, comprueba el canal (0.5s):**
 
@@ -286,6 +317,9 @@ Detalle completo y límites: `docs/pantalla-virtual.md` en el repo de CostPhone.
 - El árbol y el snapshot exigen el servicio activado: Ajustes → Accesibilidad
   → CostPhone ON.
 - Las refs [ime]/[ovl] requieren app >= v1.1 (dump multi-ventana).
+- `launch <nombre>` (resolver "whatsapp" → "com.whatsapp") y el `settle` en el
+  servidor requieren app >= v1.4; con una app anterior el CLI cae al camino
+  lento (nunca se rompe, solo va más despacio).
 
 ## Recetas
 
