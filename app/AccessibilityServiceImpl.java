@@ -127,6 +127,18 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     /** La UI ha cambiado desde el último snapshot (eventos de accesibilidad). */
     private volatile boolean uiDirty = true;
 
+    /** Versión de la UI: se incrementa con cada evento de accesibilidad. */
+    private volatile int uiVersion = 1;
+
+    /** Árbol recorrido la última vez, reutilizable si la UI no ha cambiado. */
+    private static final class TreeCache {
+        int display;
+        int version;
+        String pkg = "";
+        List<Snap.Node> nodes = new ArrayList<>();
+    }
+    private volatile TreeCache treeCache;
+
     public boolean isConnected() { return sInstance != null; }
 
     public void captureBitmap(final ScreenshotCB cb) {
@@ -273,6 +285,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             case AccessibilityEvent.TYPE_VIEW_SCROLLED:
             case AccessibilityEvent.TYPE_VIEW_SELECTED:
                 uiDirty = true;
+                uiVersion++;   // invalida la caché del árbol
                 break;
             default:
                 break;
@@ -546,27 +559,35 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 long timeout = intent.getLongExtra("timeout", 5000);
                 boolean all = intent.getIntExtra("mode", 0) == 1;
                 if (needle == null || needle.isEmpty()) return CpRes.fail("texto vacío");
-                String n = needle.toLowerCase();
                 long deadline = System.currentTimeMillis() + Math.max(200, Math.min(timeout, 60000));
                 while (System.currentTimeMillis() < deadline) {
                     List<Snap.Node> nodes = new ArrayList<>();
                     collect(d, nodes, System.currentTimeMillis() + 1500);
                     if (!nodes.isEmpty()) {
-                        // allMode=true: el waitfor tiene que ver también el texto
-                        // NO interactivo (títulos de reproductor, rótulos, celdas).
-                        List<Snap.Pick> picks = Snap.select(nodes, true, null);
-                        for (Snap.Pick p : picks) {
-                            String hay = (p.label + " " + p.node.vid).toLowerCase();
-                            if (!hay.contains(n)) continue;
-                            RefCache cache = new RefCache();
-                            cache.display = d;
-                            cache.allMode = true;
-                            cache.picks = picks;
-                            cache.stamp = System.currentTimeMillis();
-                            refCache = cache;
-                            uiDirty = false;
-                            return CpRes.ok("encontrado @" + p.ref)
-                                .withText(Snap.render(pkgOf(d), nodes, picks, true, d));
+                        // Búsqueda directa: no se construye el snapshot entero
+                        // en cada sondeo (costaba O(n) etiquetas por vuelta,
+                        // y el snapshot solo hace falta cuando ya apareció).
+                        Snap.Index idx = Snap.index(nodes);
+                        int hit = Snap.findMatch(idx, needle);
+                        if (hit >= 0) {
+                            // allMode=true: el waitfor tiene que ver también el texto
+                            // NO interactivo (títulos de reproductor, rótulos, celdas).
+                            List<Snap.Pick> picks = Snap.select(idx, true, null);
+                            Snap.Pick match = null;
+                            for (Snap.Pick p : picks) {
+                                if (p.node == nodes.get(hit)) { match = p; break; }
+                            }
+                            if (match != null) {
+                                RefCache cache = new RefCache();
+                                cache.display = d;
+                                cache.allMode = true;
+                                cache.picks = picks;
+                                cache.stamp = System.currentTimeMillis();
+                                refCache = cache;
+                                uiDirty = false;
+                                return CpRes.ok("encontrado @" + match.ref)
+                                    .withText(Snap.render(pkgOf(d), nodes, picks, true, d));
+                            }
                         }
                     }
                     try { Thread.sleep(120); } catch (InterruptedException e) { break; }
@@ -830,6 +851,13 @@ public class AccessibilityServiceImpl extends AccessibilityService {
 
     /** Paquete de la ventana activa de un display (para las cabeceras). */
     private String pkgOf(int displayId) {
+        // si el árbol ya está recorrido, se reutiliza su paquete: pedir la
+        // raíz otra vez es otra llamada al framework de accesibilidad.
+        TreeCache cache = treeCache;
+        if (cache != null && cache.display == displayId && cache.version == uiVersion
+                && !cache.pkg.isEmpty()) {
+            return cache.pkg;
+        }
         AccessibilityNodeInfo root = rootFor(displayId);
         if (root == null) return "";
         CharSequence p = root.getPackageName();
@@ -840,33 +868,59 @@ public class AccessibilityServiceImpl extends AccessibilityService {
      * Recorre las ventanas del display y guarda los nodos con contenido.
      * Con presupuesto de tiempo: una pantalla patológica no puede dejar el
      * receptor de broadcast colgado (y por tanto matar la app).
+     *
+     * CACHE: recorrer el árbol son miles de llamadas al framework de
+     * accesibilidad (cada getter es un IPC). Si la UI no ha cambiado desde
+     * el último recorrido, se reutiliza el árbol anterior en vez de volver
+     * a pagarlo. Con esto, el "launch -> waitfor -> snap" típico solo
+     * recorre el árbol UNA vez (el waitfor lo deja cacheado y el snap lo
+     * reutiliza), y el sondeo del waitfor es casi gratis.
      */
     private void collect(int displayId, List<Snap.Node> out, long deadline) {
+        TreeCache cache = treeCache;
+        if (cache != null && cache.display == displayId && cache.version == uiVersion) {
+            out.addAll(cache.nodes);
+            return;
+        }
+        int v0 = uiVersion;      // si un evento salta durante el recorrido, el
+                                // árbol queda marcado como viejo y se rehace
         AccessibilityNodeInfo root = rootFor(displayId);
         if (root == null) return;
-        collectNode(root, 0, MAX_DEPTH, "", "", out, deadline);
+        List<Snap.Node> fresh = new ArrayList<>();
+        collectNode(root, 0, MAX_DEPTH, "", "", fresh, deadline);
         List<AccessibilityWindowInfo> wins = windowsOf(displayId);
-        if (wins == null) return;
-
-        Rect mainRect = new Rect();
-        root.getBoundsInScreen(mainRect);
-        String mainPkg = String.valueOf(root.getPackageName());
-        for (int i = 0; i < wins.size(); i++) {
-            if (System.currentTimeMillis() > deadline) break;
-            AccessibilityWindowInfo aw = wins.get(i);
-            if (aw == null) continue;
-            if (aw.getDisplayId() != displayId) continue;   // ventanas de otra pantalla
-            AccessibilityNodeInfo wroot = null;
-            try { wroot = aw.getRoot(); } catch (Exception e) { continue; }
-            if (wroot == null) continue;
-            Rect wr = new Rect();
-            wroot.getBoundsInScreen(wr);
-            String wpkg = String.valueOf(wroot.getPackageName());
-            if (wr.equals(mainRect) && wpkg.equals(mainPkg)) continue;
-            String kind = windowTag(aw.getType());
-            if (kind == null) continue;   // TYPE_APPLICATION duplicada: omitir
-            collectNode(wroot, 0, MAX_DEPTH, kind, wpkg, out, deadline);
+        String rootPkg = "";
+        if (wins != null) {
+            Rect mainRect = new Rect();
+            root.getBoundsInScreen(mainRect);
+            String mainPkg = String.valueOf(root.getPackageName());
+            rootPkg = mainPkg;
+            for (int i = 0; i < wins.size(); i++) {
+                if (System.currentTimeMillis() > deadline) break;
+                AccessibilityWindowInfo aw = wins.get(i);
+                if (aw == null) continue;
+                if (aw.getDisplayId() != displayId) continue;   // ventanas de otra pantalla
+                AccessibilityNodeInfo wroot = null;
+                try { wroot = aw.getRoot(); } catch (Exception e) { continue; }
+                if (wroot == null) continue;
+                Rect wr = new Rect();
+                wroot.getBoundsInScreen(wr);
+                String wpkg = String.valueOf(wroot.getPackageName());
+                if (wr.equals(mainRect) && wpkg.equals(mainPkg)) continue;
+                String kind = windowTag(aw.getType());
+                if (kind == null) continue;   // TYPE_APPLICATION duplicada: omitir
+                collectNode(wroot, 0, MAX_DEPTH, kind, wpkg, fresh, deadline);
+            }
+        } else {
+            rootPkg = String.valueOf(root.getPackageName());
         }
+        out.addAll(fresh);
+        TreeCache tc = new TreeCache();
+        tc.display = displayId;
+        tc.version = v0;
+        tc.pkg = rootPkg;
+        tc.nodes = fresh;
+        treeCache = tc;
     }
 
     private void collectNode(AccessibilityNodeInfo node, int depth, int maxDepth,
