@@ -1,12 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.accessdroid.termux"
-    android:versionCode="11"
-    android:versionName="1.2">
+    android:versionCode="12"
+    android:versionName="1.3">
 
     <!-- CostPhone: solo servicio de accesibilidad + lanzar apps -->
     <uses-permission android:name="android.permission.BIND_ACCESSIBILITY_SERVICE"/>
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+    <!-- Canal rápido: socket TCP en 127.0.0.1 para que el CLI de Termux
+         mande las órdenes sin broadcast ni ficheros. Android exige INTERNET
+         para abrir cualquier socket, también de loopback. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <!-- Pantalla virtual (overlay_display_devices). Se concede UNA vez con:
          adb shell pm grant com.accessdroid.termux android.permission.WRITE_SECURE_SETTINGS
          Sin este permiso la app sigue funcionando igual, solo no puede crear
@@ -54,6 +58,17 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config"/>
         </service>
+
+        <!-- Receptor aparte: permite activar el servicio de accesibilidad
+             aunque esté apagado (Android lo desactiva en cada actualización).
+             Solo se activa a sí mismo y exige el secreto compartido. -->
+        <receiver
+            android:name=".EnableReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.accessdroid.termux.ACTION_ENABLE_SERVICE"/>
+            </intent-filter>
+        </receiver>
 
     </application>
 </manifest>

@@ -50,6 +50,9 @@ def parse(path):
             if not m:
                 continue
             indent, cls, vid, l, t, r, b, txt, desc = m.groups()
+            # el volcado antiguo escribía "id=null" cuando el nodo no tenía id
+            if vid == "null":
+                vid = ""
             l, t, r, b = int(l), int(t), int(r), int(b)
             flags = set()
             while True:

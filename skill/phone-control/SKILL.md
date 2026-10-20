@@ -1,13 +1,85 @@
 ---
 name: phone-control
-description: "Control del teléfono Android del usuario desde Termux con amctl (servicio de accesibilidad CostPhone): leer la pantalla como texto, snapshot con refs @pN, tap por referencia, click por texto/id, escribir, swipe, lanzar apps, capturas PNG. Úsala cuando el usuario pida hacer algo en su teléfono (WhatsApp, Instagram, Facebook/Meta Business, ajustes, cualquier app), ver qué hay en pantalla, o automatizar la UI de Android. English: control the user's Android phone."
+description: "Control del teléfono Android del usuario desde Termux con amctl (servicio de accesibilidad CostPhone): leer la pantalla como texto, snapshot con refs @pN, tap por referencia, click por texto/id, escribir, swipe, lanzar apps, capturas. Úsala cuando el usuario pida hacer algo en su teléfono (WhatsApp, Instagram, Facebook/Meta Business, ajustes, cualquier app), ver qué hay en pantalla, o automatizar la UI de Android. English: control the user's Android phone."
 ---
 
 # phone-control — el teléfono como un navegador
 
 Equivalente móvil de agent-browser. El CLI es `amctl` (~/bin/amctl), que habla
-con el servicio de accesibilidad CostPhone (com.accessdroid.termux) e incluye
-el `secret` automáticamente.
+con el servicio de accesibilidad CostPhone (com.accessdroid.termux).
+
+> ## ⚡ REGLA DE ORO
+> Todo va por socket local: **cada orden cuesta 0.4-1.5s y te dice si
+> funcionó**. No hay modo lento. Si una orden te está tardando 3-9s, el
+> problema no es la orden: es que estás usando un patrón lento
+> (`sleep`, `head -40`, `launch` + espera, un tool-call por acción).
+> Mira los anti-patrones de abajo antes de seguir.
+
+## ⚡ Velocidad: las tres reglas que más ahorran tiempo
+
+1. **Una sola llamada de bash por paso del bucle.** Cada tool-call cuesta
+   segundos de ida y vuelta. Encadena con `;` o `&&`:
+   ```bash
+   amctl launch com.whatsapp; amctl waitfor "Preguntar a Meta AI" 8000; amctl snap
+   ```
+   Tres comandos, una llamada, una respuesta al modelo.
+2. **Nada de `sleep` a ciegas.** `amctl waitfor "texto" [ms]` espera dentro del
+   servicio y vuelve en cuanto aparece (o avisa al expirar). Es 5-10x más
+   rápido que `sleep 6` + `snap` de prueba.
+3. **Prefiere `click`/`clickid` a `snap`+`tapref` cuando tengas el id.** Un
+   click por id es una orden (0.4-1.3s); el ciclo snapshot+tap son dos y además
+   hay que re-snapshotar después.
+
+Tiempos **medidos** en el dispositivo de referencia (Android 16).
+
+| Orden | Coste real | Notas |
+|---|---|---|
+| `tap`, `longpress`, `swipe`, `scroll`, `back`, `home`, `recents` | 0.4-0.6s | vuelan y no devuelven nada que leer |
+| `click "texto"`, `clickid <id>`, `type`, `focus`, `paste` | 0.4-1.3s | el servicio confirma si funcionó |
+| `snap`, `tree` | 0.5-0.9s | vuelca la pantalla; usa `--filter` si hay mucho |
+| `tapref` | 0.5-1.4s | re-resuelve la ref en el servidor (evita el toque en sitio equivocado) |
+| `see` (captura) | 0.9-1.3s | solo si de verdad necesitas la imagen |
+| `launch` | 0.6-0.9s | |
+| `waitfor` | lo que tarde el elemento (0.6-2.4s) | mejor que cualquier `sleep` |
+
+Regla práctica: **el coste real de una orden es ~0.5-1.5s**, así que lo que
+manda es el número de tool-calls, no el tiempo dentro de cada orden.
+
+### ❌ Anti-patrones (los que se comen el tiempo)
+
+| ❌ Lento (y frágil) | ✅ Rápido | Por qué |
+|---|---|---|
+| `amctl launch X && sleep 8 && amctl snap` | `amctl launch X; amctl waitfor "texto" 10000` | el sleep es a ciegas: 8s siempre, o 0.5s si `waitfor` |
+| `amctl snap \| head -40` | `amctl snap --filter "lo que buscas"` + `head -8` | 40 líneas de ruido = 40 líneas de contexto para nada |
+| `amctl launch com.android.chrome` y luego buscar la URL | `amctl openurl "https://…"` | Chrome **restaura la sesión anterior** (te deja en otra página) y además hay que pelear con el omnibox |
+| `snap` → `tapref` → `snap` → `tapref` | `clickid <id>` o `click "texto"` cuando el id se sepa | dos órdenes y dos tool-calls por acción |
+| un `amctl` por tool-call | `amctl a; amctl b; amctl c` en una sola llamada | cada tool-call cuesta ida y vuelta |
+| `sleep 3` "por si acaso" entre dos acciones | `amctl tapref @pN --settle 500` | espera real, no adivinada |
+| `waitfor "<título>"` justo después de abrir un video | `snap --filter "minutos"` y mira la **duración** | el overlay del reproductor se oculta a los ~3 s: el `waitfor` del título expira aunque el video esté cargado. Duración ≤60 s = es el anuncio; la duración real es la prueba |
+
+**Antes de la primera orden de cada tarea, comprueba el canal (0.5s):**
+
+```bash
+amctl status | head -1     # "canal rápido: OK (127.0.0.1, respuesta: pong)" = todo lo de arriba
+```
+
+Si dice que no está disponible: `amctl enable` (re-activa el servicio tras una
+actualización de la app) y reintenta.
+
+## Arranque de tarea (los primeros 30 segundos)
+
+Cada tarea empieza igual — no te saltes el paso 1, decide cómo de rápido vas:
+
+```bash
+amctl status | head -1                    # 1. ¿canal rápido? (0.5s). Si no: amctl enable
+amctl launch com.<app>                    # 2. abrir la app   (0.6-0.9s)
+amctl waitfor "<texto que esperas>" 10000 # 3. esperar de verdad (0.6-2.4s) — NUNCA sleep
+amctl snap --filter "<lo que buscas>"     # 4. leer solo lo que importa (0.5s)
+amctl clickid <id> | amctl tapref @pN     # 5. actuar (0.5-1.4s)
+```
+
+Para una web, el paso 2 es `amctl openurl "<url>"` en vez de `launch` (Chrome
+restaura la sesión anterior si lo lanzas a pelo).
 
 ## El bucle central (igual filosofía que agent-browser)
 
@@ -22,68 +94,130 @@ Las refs se asignan frescas en cada `snap` y **quedan obsoletas en cuanto la
 pantalla cambia** (navegar, abrir un diálogo, teclado, etc.). Antes de cada
 acción por ref: re-snapshot.
 
+`tapref` es inteligente: si la pantalla no ha cambiado desde el snapshot, toca
+directamente; si ha cambiado, busca el mismo elemento y, si ya no existe,
+contesta **"obsoleta — re-snapshot"** en vez de tocar una posición equivocada.
+Si te dice eso, `amctl snap` y sigue.
+
 ## Leer la pantalla
 
 | Comando | Qué hace |
 |---|---|
 | `amctl snap` | Solo interactivos (clicables, editables, check) con refs @pN |
 | `amctl snap -a` | Interactivos + todos los nodos con texto (lectura completa) |
-| `amctl snap --filter "chat"` | Filtra por texto o id |
-| `amctl tree` | Árbol crudo completo → /sdcard/Download/accessdroid-tree.txt (leerlo con la tool read) |
-| `amctl see` | Captura PNG → /sdcard/Download/accessdroid-shot.png (leerla con read: es una imagen) |
+| `amctl snap --filter "chat"` | Filtra por texto o id (úsalo en pantallas densas) |
+| `amctl waitfor "texto" [ms]` | Espera a que aparezca un texto y devuelve el snapshot de ese instante (con refs) |
+| `amctl tree` | Árbol crudo completo (formato largo: úsalo solo para depurar) |
+| `amctl see` | Captura JPEG → /sdcard/Download/accessdroid-shot.jpg (léela con read: es una imagen) |
 
 El snapshot trae: ref, clase, texto, id corto y **coordenadas del centro**.
 Si el teclado o una barra flotante (Seleccionar todo/Pegar) están abiertos,
 sus elementos aparecen también como refs, marcados **[ime]** (teclado — Enter,
 borrar ⌫, stickers...), **[ovl]** (toolbar flotante) o **[sys]** (overlays del
 sistema). Ya no hay que adivinar coordenadas del teclado: Enter y ⌫ son refs.
-Cuando falla `see`, el motivo exacto queda en
-/sdcard/Download/accessdroid-shot-error.txt.
 
 ## Actuar
 
 | Comando | Qué hace |
 |---|---|
 | `amctl tapref @p3` | Toca el centro del elemento (ref del último snap) |
+| `amctl tapref @p3 --settle 500` | Idem + espera a que la pantalla se asiente |
 | `amctl tap X Y` | Toque crudo en coordenadas (p.ej. de `snap -a`) |
-| `amctl tapshot X Y [W H]` | Toca coords vistas en el PNG del último `see` (W H = tamaño con el que viste la imagen); escalea a coords reales |
+| `amctl tapshot X Y [W H]` | Toca coords vistas en la captura (W H = tamaño con el que viste la imagen); escalea a coords reales |
 | `amctl longpress X Y [ms]` | Pulsación larga |
 | `amctl swipe X1 Y1 X2 Y2 [ms]` | Deslizar/arrastrar |
-| `amctl scroll down\|up [x y]` | Scroll |
-| `amctl click "texto"` | Click por texto visible (fallback sin snapshot) |
-| `amctl clickid <id>` | Click por resource-id (p.ej. `com.whatsapp:id/send`) |
-| `amctl type "texto"` | Escribe en el campo con foco ([edt][FOCUS] en snap). **REEMPLAZA todo el contenido** (setText), desconocido no appenda |
+| `amctl scroll down\|up [x y]` | Scroll **semántico** (la app desplaza su propia lista; si no hay nada scrolleable cae al gesto) |
+| `amctl click "texto"` | Click por texto visible — **más rápido que snapshot+tapref**. Elige el nodo más específico (el botón, no el contenedor que concatena el texto de sus hijos) y si el nodo no acepta el click hace un toque real en su centro |
+| `amctl clickid <id>` | Click por resource-id — idem, la vía más rápida. Acepta el **id corto** tal como lo muestra el snapshot (`#send` → `clickid send`) o el completo (`com.whatsapp:id/send`) |
+| `amctl type "texto"` | Escribe en el campo con foco ([edt][FOCUS] en snap). **REEMPLAZA todo el contenido** (setText), desconocido no appenda. Si el campo lo rechaza (input web/React), cae solo al **teclado en pantalla** |
 | `amctl cleartext` | Vacía el campo con foco |
 | `amctl paste` | Pega el clipboard en el campo con foco |
 | `amctl focus "texto"` | Da foco a un campo por texto (o resource-id) |
 | `amctl openurl <url>` | Navega al URL en el Chrome default — SIN pelear con el omnibox (mejor que tap URL + type + Enter) |
-| `amctl float <texto> [pkg]` | Pon la app en ventana flotante (recents → long-press en tarjeta → "ventanas flotantes" de MIUI). `float X pkg Y split` = pantalla dividida. Si no está en recents, lánzala con pkg |
+| `amctl float <texto> [pkg]` | Pon la app en ventana flotante (recents → long-press → "ventanas flotantes" de MIUI). `float X pkg Y split` = pantalla dividida |
 | `amctl back` / `home` / `recents` | Botones del sistema |
-| `amctl launch <pkg>` | Abre app (terceros: vía servicio CostPhone) |
+| `amctl launch <pkg>` | Abre app |
 | `amctl scrollto "texto"` | Busca y hace scroll a un texto |
 
-Para escribir: `tapref` al campo `[edt]` (o `clickid ...entry`) → `amctl type` →
-`tapref` al botón enviar (`'Enviar'` / `#send`) → `snap` para verificar.
+**Cuidado con el orden tap → snap:** el gesto tarda ~80ms y la app tarda en
+reaccionar. Si encadenas `tapref && snap` en la misma llamada, el snapshot
+puede salir **antes** del cambio. Usa `amctl tapref @p3 --settle 500` o mete un
+`; sleep 0.5` entre el tap y el snap.
+
+Para escribir: `tapref` al campo `[edt]` (o `clickid ...entry`) → `amctl type`
+→ `tapref` al botón enviar (`'Enviar'` / `#send`) → `snap` para verificar.
+
+**Si `type` dice "el campo aceptó el texto pero no lo muestra":** ese campo no
+es un campo de escritura, es un **desplegable/combobox** (por ejemplo el
+selector de categoría de la Biblioteca de Anuncios de Meta). Elige la opción
+con `click "texto"` en vez de escribir. Si dice "el campo rechazó el texto
+(ni setText ni teclado)", es un input web/React: el servicio cae entonces al
+**teclado en pantalla** y escribe pulsando las teclas (`escrito (teclado): …`);
+si el teclado no está visible, ábrelo antes (toca el campo y espera a que
+salgan las teclas `[ime]`) y reintenta. Con `type --settle` o un `tapref`
+previo con más margen, el campo suele aceptar el texto.
+
+**Regla:** desde v1.3 `type` **verifica** que el texto aparezca en pantalla
+antes de decir "escrito". Si te dice que escribió, está escrito.
 
 Para navegar (Chrome/otro navegador): SIEMPRE primero
 `amctl openurl "https://..."` — saltarse el omnibox evita autocompletados,
-Enter fallido a ciegas, y páginas erróneas. Solo recurrir a snap URL+type si
-openurl no existiera.
+Enter fallido a ciegas, y páginas erróneas.
 
-## Ejemplo real verificado (WhatsApp)
+## YouTube: buscar y reproducir (receta verificada)
+
+Los atajos que fallan en YouTube, y lo que funciona:
+
+| Atajo | Qué pasa | ✅ Lo que funciona |
+|---|---|---|
+| `scroll down` para bajar en los resultados | el gesto aterriza en System UI (panel de notificaciones) | `amctl swipe 540 1700 540 700 700` — un arrastre, como un dedo |
+| `waitfor "Buscar"` tras abrir la app | si la app restauró la página anterior, no existe ese botón | `waitfor` de lo que de verdad quieres ver, o `snap` y decide |
+| `click "Saltar anuncio"` | el texto vive en el overlay **padre** y en el botón: el clic cae en el padre y no salta nada | `amctl clickid skip_ad_button` (id corto, tal cual lo muestra el snapshot) |
+| `waitfor "<título del video>"` | el overlay del reproductor **se oculta a los ~3 s**: si el waitfor empieza después, expira aunque el video esté cargado | verifica con la **barra de progreso**: `snap --filter "minutos"` → `"0 minutos 14 segundos de 3 minutos y 33 segundos"` (duración real) |
+| tocar el reproductor para "despertar" los controles | en YouTube un toque en la superficie **pausa** el video | usa `back` o `clickid` sobre el botón de play real |
+
+Pista de oro: **una duración de ≤60 s = es el anuncio**; la duración del video real
+(3 min 33 s en Poker Face) es la prueba de que la reproducción es la buena.
+
+Flujo natural completo (sin deep-links):
 
 ```bash
-amctl launch com.whatsapp && sleep 6
-amctl snap                       # @p1 [EditText] 'Preguntar a Meta AI...' ...
-                                 # fila del primer chat = ViewGroup clicable con nombre concatenado
-amctl tapref @p3                 # abre el primer chat
-amctl snap                       # confirmar conversación abierta (conversation_contact_name)
-amctl clickid com.whatsapp:id/entry
-amctl type "No"
-amctl snap                       # ver la ref del botón 'Enviar'
-amctl tapref @pN                 # (o: amctl clickid com.whatsapp:id/send)
-amctl snap                       # verificar que el mensaje salió
+amctl launch com.google.android.youtube
+amctl click "Buscar"; amctl waitfor "Buscar en YouTube" 6000
+amctl type "poker face lady gaga"                     # verificado: "escrito: …"
+amctl tapref @p4 --settle 1500                       # @p4 = fila de sugerencia (autocompletado)
+amctl swipe 540 1700 540 700 700                     # baja a los vídeos (2 swipes)
+amctl snap --filter "Official"                       # @p1 = "Lady Gaga - Poker Face (Official Music Video)"
+amctl tapref @p1 --settle 1200                       # abre el video
+amctl clickid skip_ad_button                         # salta el anuncio (si lo hay)
+amctl snap --filter "minutos"                        # verifica: "... de 3 minutos y 33 segundos"
 ```
+
+El autocompletado de YouTube **tapa los resultados**: el `waitfor "<consulta>"`
+da falso positivo porque la sugerencia ya contiene ese texto. Toca la fila de
+sugerencia para de verdad buscar, y verifica con el `snap` de resultados.
+
+
+
+```bash
+amctl launch com.whatsapp
+amctl waitfor "buscar" 10000              # barra "Preguntar a Meta AI o buscar"
+amctl snap                                  # @p1 = barra de búsqueda
+amctl tapref @p1
+amctl type "+57 310 4618120"
+amctl waitfor "310 4618120" 10000           # el campo ya tiene el número
+amctl snap --filter "4618120"              # @pN = fila del contacto (row_container)
+amctl tapref @pN                            # abre el chat
+amctl waitfor "Mensaje" 8000
+amctl type "Hola"
+amctl snap --filter "Enviar"                # @pN = botón #send
+amctl tapref @pN
+amctl snap --filter "Hola" -a               # verificar la burbuja enviada
+```
+
+Notas del caso real: el `type` **reemplaza** el contenido del campo, así que
+para escribir un número en un buscador que ya tenía texto, `type` vale.
+El contacto del ejemplo era el propio número ("+57 310 4618120 (Tú)").
 
 ## Pantalla virtual — trabajar aparte sin molestar al usuario (app v1.2+)
 
@@ -135,32 +269,55 @@ Reglas para no cagarla:
 
 Detalle completo y límites: `docs/pantalla-virtual.md` en el repo de CostPhone.
 
-## Transporte y limitaciones (Termux estable v0.118.3)
+## Transporte y estado
 
-- Transporte `am` clásico (socket AM no existe en v0.118.x). No funcionan los
-  comandos `list/find/stop/info/perms/grant/revoke/clear` (necesitan socket).
-- `launch` de apps de terceros va vía el servicio (hay límite de visibilidad de
-  paquetes del `am` clásico). Si falla: `am start -n <pkg>/<Activity>` explícito.
-- `openurl`/`cleartext`/`paste`/`focus`/`tapshot` funcionan en ambos transportes.
-- El árbol exige el servicio activado: Ajustes → Accesibilidad → CostPhone ON.
-  Las refs [ime]/[ovl] requieren app >= v1.1 (dump multi-ventana). Con v1.0.x
-  el snap sigue funcionando pero sin elementos del teclado.
+- **Todo va por un socket TCP local (127.0.0.1).** La orden y su respuesta
+  viajan en el mismo viaje: sin ficheros de por medio, sin esperas, y **el
+  servicio te dice si la orden funcionó** ("escrito: hola", "no se encontró el
+  texto 'X'", "ref obsoleta"). Si una orden no está disponible o falla, la
+  respuesta te lo dice: no hay un canal "alternativo" más lento al que
+  recurrir.
+- Si `amctl` avisa de que el canal no está disponible: `amctl enable`
+  (re-activa el servicio tras una actualización de la app) y reintenta.
+- `launch` de apps de terceros: la app lo resuelve; si hace falta, pasa el
+  paquete completo (ej: `com.android.chrome`).
+- El árbol y el snapshot exigen el servicio activado: Ajustes → Accesibilidad
+  → CostPhone ON.
+- Las refs [ime]/[ovl] requieren app >= v1.1 (dump multi-ventana).
 
 ## Recetas
 
 - **Navegar a una página:** `amctl openurl "https://github.com/user/repo/settings/access"`.
   Nunca construir la navegación escribiendo en el omnibox (autocompletado + Enter ciego).
-- **Código de verificación GitHub (sudo mode) en Chrome:** Settings pide código →
-  `amctl launch com.google.android.gm` → `amctl snap` (el código suele venir
-  en el texto de la fila del correo GitHub, sin abrirlo) → volver con
-  `amctl launch com.android.chrome` → tap al campo → `amctl type "<código>"`.
-- **Formulario web largo / muchos campos en diálogos:** `snap` al campo [edt] → tapref →
-  si ya tiene texto: `amctl cleartext` (o directamente `type` que reemplaza).
-  Seleccionar todo/Pegar están en toolbars [ovl] cuando están visibles.
+  **Y nunca `amctl launch com.android.chrome` antes:** Chrome restaura la pestaña
+  o sesión anterior y te deja en una página que no te sirve (te toca perder un
+  `back` extra). `openurl` va directo a la URL, en el navegador por defecto.
+  Si necesitas el navegador de verdad (menú, pestañas), entonces sí `launch`,
+  y entonces `waitfor` a lo que buscas.
+- **Forzar el navegador:** `amctl openurl "<url>" com.android.chrome` abre la URL
+  en Chrome aunque otra app sea la predeterminada. Útil cuando la app nativa
+  (Facebook para la Biblioteca de Anuncios) usa un WebView que rechaza
+  `setText`: en Chrome el mismo campo sí acepta el texto.
+- **Esperar a que una app cargue:** `amctl waitfor "texto que aparece" 15000`
+  en vez de `sleep 6` + snap.
+- **Formulario web largo / muchos campos en diálogos:** `snap` al campo [edt] →
+  tapref → si ya tiene texto: `amctl cleartext` (o directamente `type` que
+  reemplaza). Seleccionar todo/Pegar están en toolbars [ovl] cuando están
+  visibles.
 - **Enter / borrar sin teclado físico:** con el teclado abierto, `amctl snap`
   y buscar las refs [ime] (fila final: Enter y ⌫). Tapref a esas refs.
-- **Tocs desde un screenshot:** leer el PNG con read; si la imagen viene
-  redimensionada, `amctl tapshot X Y W H` con el tamaño con el que la viste.
+- **Tocs desde una captura:** leer la imagen con read; si viene redimensionada,
+  `amctl tapshot X Y W H` con el tamaño con el que la viste.
+- **Elemento que NO sale en el árbol** (canvas, WebView, botón custom de MIUI):
+  `amctl ocr "<texto>"` lo localiza en la captura por OCR y devuelve sus
+  píxeles. Añade `--region x,y,w,h` con la zona aproximada: baja de 19s a 2,6s.
+  Ejemplo real: el botón "Actualizar" del instalador de MIUI no existe en el
+  árbol de accesibilidad, y `amctl ocr "Actualizar" --region 700,1300,300,120`
+  lo encontró en (850,1380) en 2,6s.
+  ⚠ Ojo: en MIUI ese botón además **ignora los toques inyectados** (sí acepta
+  "Cancelar"), así que hay que tocarlo a mano. La visión no arregla eso.
+- **Pantalla densa (chat largo):** `amctl snap --filter "lo que buscas"` en vez
+  de `snap -a` completo: menos ruido, menos tokens, más rápido.
 
 ## Seguridad
 
@@ -172,18 +329,15 @@ Detalle completo y límites: `docs/pantalla-virtual.md` en el repo de CostPhone.
 ## Troubleshooting
 
 - ⚠ **IMPORTANTE — al instalar/actualizar la app, Android DESACTIVA el servicio
-  de accesibilidad.** Tras cada update hay que reactivarlo: Ajustes →
-  Accesibilidad → CostPhone → Activar. El panel CostPhone lo muestra en rojo.
-- Desde 2026-10, `amctl tree/snap/see` **borran el archivo antes de pedirlo y
-  verifican que el servicio lo regenere** — si el servicio está apagado ahora
-  imprimen "(⚠ SERVICIO NO RESPONDE...)" en vez de devolver datos viejos.
-  NUNCA confiar en un archivo leído sin la verificación de freshness.
-- `snap` vacío o sin refs → servicio apagado, o app vieja (reinstalar APK actual
-  de /storage/emulated/0/Download/CostPhone-v1.0.X.apk).
-- "ref @pN no existe" → la pantalla cambió: `amctl snap` de nuevo.
+  de accesibilidad.** Tras cada update hay que reactivarlo: `amctl enable`
+  (la app tiene `WRITE_SECURE_SETTINGS` concedido y se auto-activa; si algún
+  día no lo tuviera, el comando **abre directamente la pantalla de
+  Accesibilidad** y avisa de que hay que activar el interruptor).
+- "canal no disponible" → el servicio está apagado: `amctl enable` y reintenta.
+  (`amctl status` lo dice en una línea.)
+- `snap` vacío o sin refs → servicio apagado: `amctl enable`, luego `amctl snap`.
+- "ref @pN no existe" o "obsoleta" → la pantalla cambió: `amctl snap` de nuevo.
 - Elemento no visible → `amctl scroll down` / `swipe` y re-snap.
 - Play Protect bloquea instalar APKs propios ("Aplicación bloqueada") → tocar
   Entendido y reintentar, o desactivar temporalmente el análisis en Play Store
   → Play Protect, instalar, y reactivar. NO es APK corrupto.
-- El árbol no se actualiza → verificar servicio; los archivos se escriben en
-  /sdcard/Download/accessdroid-*.txt|png.

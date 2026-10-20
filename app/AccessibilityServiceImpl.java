@@ -28,6 +28,9 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 
 public class AccessibilityServiceImpl extends AccessibilityService {
 
@@ -64,10 +67,22 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     private static final String ACTION_POWER = "com.accessdroid.termux.ACTION_POWER";
     private static final String ACTION_DISPLAY = "com.accessdroid.termux.ACTION_DISPLAY";
     private static final String ACTION_DISPLAY_BACK = "com.accessdroid.termux.ACTION_DISPLAY_BACK";
+    // Canal rápido (socket local) y snapshot calculado en el servidor
+    private static final String ACTION_GET_SNAPSHOT = "com.accessdroid.termux.ACTION_GET_SNAPSHOT";
+    private static final String ACTION_TAPREF = "com.accessdroid.termux.ACTION_TAPREF";
+    private static final String ACTION_WAITFOR = "com.accessdroid.termux.ACTION_WAITFOR";
+    public static final String ACTION_ENABLE_SERVICE = "com.accessdroid.termux.ACTION_ENABLE_SERVICE";
+    private static final String ACTION_PING = "com.accessdroid.termux.ACTION_PING";
 
     /** Pantalla virtual (display secundario). */
     static final String SETTING_OVERLAY_DISPLAYS = "overlay_display_devices";
     static final String FILE_DISPLAYS = "accessdroid-displays.txt";
+    static final String FILE_ERROR = "accessdroid-error.txt";
+    static final String FILE_SHOT_ERROR = "accessdroid-shot-error.txt";
+
+    private static final int MAX_NODES = 3500;       // tope del volcado
+    private static final long DUMP_BUDGET_MS = 5000;  // presupuesto de tiempo del volcado
+    private static final int MAX_DEPTH = 25;
 
     /**
      * Flags que acepta AOSP en overlay_display_devices. Allowlist estricta a
@@ -83,10 +98,34 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     BroadcastReceiver receiver;
     Handler handler = new Handler(Looper.getMainLooper());
     // Shared secret – set via build-time constant or default. amctl must send it.
-    static final String SECRET = "termux-accessdroid-2025";
+    public static final String SECRET = "termux-accessdroid-2025";
     // Screenshot callback state
     interface ScreenshotCB { void onResult(android.graphics.Bitmap bmp); }
     ScreenshotCB pendingCb = null;
+
+    /** Trabajo pesado fuera del hilo principal (nada de bloqueos en onReceive). */
+    private final ExecutorService worker = Executors.newFixedThreadPool(3, new ThreadFactory() {
+        @Override public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "cp-worker");
+            t.setDaemon(true);
+            return t;
+        }
+    });
+
+    /** Canal rápido por TCP loopback. */
+    private CpServer server;
+
+    /** Último snapshot calculado aquí (para tapref sin volver a descargar). */
+    private static final class RefCache {
+        int display;
+        boolean allMode;
+        List<Snap.Pick> picks = new ArrayList<>();
+        long stamp;
+    }
+    private RefCache refCache;
+
+    /** La UI ha cambiado desde el último snapshot (eventos de accesibilidad). */
+    private volatile boolean uiDirty = true;
 
     public boolean isConnected() { return sInstance != null; }
 
@@ -111,6 +150,20 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         return displayId == android.view.Display.DEFAULT_DISPLAY
             ? "accessdroid-shot.png"
             : "accessdroid-shot-d" + displayId + ".png";
+    }
+
+    /** Nombre de la captura en el canal rápido (JPEG, mucho más rápido de escribir). */
+    static String shotFileJpg(int displayId) {
+        return displayId == android.view.Display.DEFAULT_DISPLAY
+            ? "accessdroid-shot.jpg"
+            : "accessdroid-shot-d" + displayId + ".jpg";
+    }
+
+    /** Nombre del árbol por display (evita que un snap en dN pise el de d0). */
+    static String treeFile(int displayId) {
+        return displayId == android.view.Display.DEFAULT_DISPLAY
+            ? "accessdroid-tree.txt"
+            : "accessdroid-tree-d" + displayId + ".txt";
     }
 
     /* Save a file to the public Downloads collection (no storage permission needed). */
@@ -140,10 +193,27 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         screenW = dm.widthPixels;
         screenH = dm.heightPixels;
 
+        // Canal rápido: la app sirve las órdenes por TCP de loopback y el CLI
+        // las manda por ahí. Si esto falla, todo sigue funcionando por
+        // broadcast (más lento) — el CLI lo detecta y cae al canal viejo.
+        try {
+            server = new CpServer(SECRET, new CpServer.Handler() {
+                @Override public CpRes handle(String action, Map<String, Object> args) {
+                    return executeFromArgs(action, args);
+                }
+            });
+            server.start();
+        } catch (Throwable t) {
+            Log.w(TAG, "no se pudo abrir el canal rápido", t);
+        }
+
         receiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                handleCommand(intent);
+                // goAsync() vive en el receptor: el trabajo pesado sigue vivo
+                // fuera de onReceive sin bloquear el hilo principal.
+                final BroadcastReceiver.PendingResult pending = goAsync();
+                handleBroadcast(intent, pending);
             }
         };
         IntentFilter filter = new IntentFilter();
@@ -178,12 +248,36 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         filter.addAction(ACTION_POWER);
         filter.addAction(ACTION_DISPLAY);
         filter.addAction(ACTION_DISPLAY_BACK);
+        filter.addAction(ACTION_GET_SNAPSHOT);
+        filter.addAction(ACTION_TAPREF);
+        filter.addAction(ACTION_WAITFOR);
+        filter.addAction(ACTION_ENABLE_SERVICE);
+        filter.addAction(ACTION_PING);
         registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
         Log.i(TAG, "AccessibilityService connected – ready");
     }
 
     @Override
-    public void onAccessibilityEvent(AccessibilityEvent event) { }
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null) return;
+        // Marca la UI como cambiada: permite saber si las refs del último
+        // snapshot siguen siendo válidas sin recorrer el árbol.
+        switch (event.getEventType()) {
+            case AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED:
+            case AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED:
+            case AccessibilityEvent.TYPE_WINDOWS_CHANGED:
+            case AccessibilityEvent.TYPE_VIEW_FOCUSED:
+            case AccessibilityEvent.TYPE_VIEW_CLICKED:
+            case AccessibilityEvent.TYPE_VIEW_LONG_CLICKED:
+            case AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED:
+            case AccessibilityEvent.TYPE_VIEW_SCROLLED:
+            case AccessibilityEvent.TYPE_VIEW_SELECTED:
+                uiDirty = true;
+                break;
+            default:
+                break;
+        }
+    }
 
     @Override
     public void onInterrupt() { }
@@ -194,38 +288,103 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         if (receiver != null) {
             try { unregisterReceiver(receiver); } catch (Exception e) { }
         }
+        if (server != null) { try { server.stop(); } catch (Exception ignored) { } server = null; }
+        try { worker.shutdownNow(); } catch (Exception ignored) { }
         sInstance = null;
     }
 
     /* -------------------------------------------------------------- */
     /*                        Command dispatcher                      */
     /* -------------------------------------------------------------- */
-    private void handleCommand(Intent intent) {
+
+    /**
+     * Canal legacy (broadcast): valida el secreto y ejecuta la orden fuera del
+     * hilo principal. El receptor tiene 10s de vida: el trabajo se hace en un
+     * hilo aparte y goAsync() mantiene vivo el receptor hasta terminar.
+     */
+    private void handleBroadcast(Intent intent, final BroadcastReceiver.PendingResult pending) {
         String action = intent.getAction();
-        if (action == null) return;
-        // Basic safety: require the shared secret from amctl.
+        if (action == null) { if (pending != null) pending.finish(); return; }
         String secret = intent.getStringExtra("secret");
         if (secret == null || !secret.equals(SECRET)) {
             Log.w(TAG, "rejected command with bad/missing secret: " + action);
+            if (pending != null) pending.finish();
             return;
         }
         Log.d(TAG, "cmd: " + action);
+        worker.execute(new Runnable() {
+            @Override public void run() {
+                CpRes res;
+                try {
+                    res = execute(intent);
+                } catch (Throwable t) {
+                    Log.w(TAG, "orden fallida", t);
+                    res = CpRes.fail("error: " + t);
+                }
+                try { persist(res); } catch (Throwable ignored) { }
+                try { if (pending != null) pending.finish(); } catch (Throwable ignored) { }
+            }
+        });
+    }
+
+    /** Guarda la carga en /sdcard/Download (solo lo necesita el canal legacy). */
+    private void persist(CpRes res) {
+        if (res == null || res.fileName == null) return;
+        try {
+            if (res.binary && res.payload != null) {
+                saveToDownloads(res.fileName, res.mime, res.payload);
+            } else if (res.text != null) {
+                saveToDownloads(res.fileName, res.mime, res.text.getBytes("UTF-8"));
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "persist fail: " + res.fileName, e);
+        }
+    }
+
+    /** Traduce los argumentos del canal rápido a extras de Intent y ejecuta. */
+    private CpRes executeFromArgs(String action, Map<String, Object> args) {
+        // El cliente puede mandar el nombre corto ("ACTION_TAP") o el completo
+        // ("com.accessdroid.termux.ACTION_TAP"). Antes se prefijaba siempre y
+        // el nombre completo acababa duplicado ("com.accessdroid.termux.com...").
+        String full = action != null && action.startsWith("com.accessdroid.termux.")
+                ? action : "com.accessdroid.termux." + action;
+        Intent intent = new Intent(full);
+        for (Map.Entry<String, Object> e : args.entrySet()) {
+            String k = e.getKey();
+            Object v = e.getValue();
+            if ("secret".equals(k)) continue;
+            if (v instanceof Integer) intent.putExtra(k, (Integer) v);
+            else if (v instanceof Long) intent.putExtra(k, (Long) v);
+            else if (v instanceof Float) intent.putExtra(k, (Float) v);
+            else if (v instanceof String) intent.putExtra(k, (String) v);
+        }
+        return execute(intent);
+    }
+
+    private CpRes execute(Intent intent) {
+        String action = intent.getAction();
+        if (action == null) return CpRes.fail("sin acción");
 
         switch (action) {
+            case ACTION_ENABLE_SERVICE:
+                return enableSelf(this);
+            case ACTION_PING:
+                return CpRes.ok("pong");
+
             case ACTION_TAP: {
                 int x = intent.getIntExtra("x", -1);
                 int y = intent.getIntExtra("y", -1);
-                if (x < 0 || y < 0) return;
+                if (x < 0 || y < 0) return CpRes.fail("coordenadas inválidas");
                 run(makeTap(x, y, 80L, disp(intent)), "tap");
-                break;
+                return CpRes.ok("tap (" + x + "," + y + ")");
             }
             case ACTION_LONG_PRESS: {
                 int x = intent.getIntExtra("x", -1);
                 int y = intent.getIntExtra("y", -1);
                 long dur = intent.getLongExtra("duration", 500);
-                if (x < 0 || y < 0) return;
+                if (x < 0 || y < 0) return CpRes.fail("coordenadas inválidas");
                 run(makeTap(x, y, dur, disp(intent)), "longpress");
-                break;
+                return CpRes.ok("longpress (" + x + "," + y + ")");
             }
             case ACTION_SWIPE: {
                 int x1 = intent.getIntExtra("x1", -1);
@@ -233,157 +392,200 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 int x2 = intent.getIntExtra("x2", -1);
                 int y2 = intent.getIntExtra("y2", -1);
                 long dur = intent.getLongExtra("duration", 300);
-                if (x1 < 0 || x2 < 0) return;
+                if (x1 < 0 || x2 < 0) return CpRes.fail("coordenadas inválidas");
                 run(makeSwipe(x1, y1, x2, y2, dur, disp(intent)), "swipe");
-                break;
+                return CpRes.ok("swipe (" + x1 + "," + y1 + ")->(" + x2 + "," + y2 + ")");
             }
             case ACTION_SCROLL_UP: {
-                android.util.DisplayMetrics dm = metricsOf(disp(intent));
+                int d = disp(intent);
+                android.util.DisplayMetrics dm = metricsOf(d);
                 int x = intent.getIntExtra("x", dm.widthPixels / 2);
                 int y = intent.getIntExtra("y", (int)(dm.heightPixels * 0.5f));
-                run(makeScroll(x, y, -0.4f, disp(intent)), "scrollUp");
-                break;
+                boolean sem = scrollSemantic(x, y, false, d);
+                if (!sem) run(makeScroll(x, y, -0.4f, d), "scrollUp");
+                return CpRes.ok(sem ? "scroll up (semántico)" : "scroll up");
             }
             case ACTION_SCROLL_DOWN: {
-                android.util.DisplayMetrics dm = metricsOf(disp(intent));
+                int d = disp(intent);
+                android.util.DisplayMetrics dm = metricsOf(d);
                 int x = intent.getIntExtra("x", dm.widthPixels / 2);
                 int y = intent.getIntExtra("y", (int)(dm.heightPixels * 0.5f));
-                run(makeScroll(x, y, 0.4f, disp(intent)), "scrollDown");
-                break;
+                boolean sem = scrollSemantic(x, y, true, d);
+                if (!sem) run(makeScroll(x, y, 0.4f, d), "scrollDown");
+                return CpRes.ok(sem ? "scroll down (semántico)" : "scroll down");
             }
             case ACTION_BACK:
                 performGlobalAction(GLOBAL_ACTION_BACK);
-                break;
+                return CpRes.ok("back");
             case ACTION_HOME:
                 performGlobalAction(GLOBAL_ACTION_HOME);
-                break;
+                return CpRes.ok("home");
             case ACTION_RECENTS:
                 performGlobalAction(GLOBAL_ACTION_RECENTS);
-                break;
+                return CpRes.ok("recents");
             case ACTION_TYPE: {
                 String text = intent.getStringExtra("text");
-                if (text != null && !text.isEmpty()) {
+                if (text == null || text.isEmpty()) return CpRes.fail("texto vacío");
+                AccessibilityNodeInfo focus = focusIn(disp(intent));
+                if (focus != null) {
                     Bundle args = new Bundle();
                     args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
-                    AccessibilityNodeInfo focus = focusIn(disp(intent));
-                    if (focus != null) {
-                        focus.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
-                        Log.i(TAG, "typed: " + text);
-                    } else {
-                        Log.w(TAG, "no focused input field");
+                    boolean ok = focus.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
+                    // setText puede devolver true y no escribir nada (combobox,
+                    // inputs React/web): hay que comprobar el texto de verdad.
+                    if (ok) {
+                        nap(150);
+                        // nodo fresco: el anterior ya está obsoleto y devuelve el texto viejo
+                        if (textLanded(focusIn(disp(intent)), text)) return CpRes.ok("escrito: " + text);
+                        if (typeWithIme(text, disp(intent)) && textLanded(focusIn(disp(intent)), text))
+                            return CpRes.ok("escrito (teclado): " + text);
+                        return CpRes.fail("el campo aceptó el texto pero no lo muestra: "
+                            + "probablemente es un desplegable (elige una opción con click) "
+                            + "y no un campo de escritura");
                     }
+                    // setText rechazado: pasa a ser un input web/React (Meta Ad Library,
+                    // algunas WebViews). Ahí solo funciona el teclado en pantalla.
+                    if (typeWithIme(text, disp(intent))) return CpRes.ok("escrito (teclado): " + text);
+                    return CpRes.fail("el campo rechazó el texto (ni setText ni teclado)");
                 }
-                break;
+                if (typeWithIme(text, disp(intent))) return CpRes.ok("escrito (teclado): " + text);
+                return CpRes.fail("no hay ningún campo de texto con el foco");
             }
             case ACTION_CLICK_TEXT: {
                 String txt = intent.getStringExtra("text");
-                if (txt != null && !txt.isEmpty()) {
-                    AccessibilityNodeInfo root = rootFor(disp(intent));
-                    if (root != null) {
-                        AccessibilityNodeInfo target = findByText(root, txt);
-                        if (target != null) {
-                            boolean ok = target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                            Log.i(TAG, "click '" + txt + "' → " + ok);
-                        }
-                    }
+                if (txt == null || txt.isEmpty()) return CpRes.fail("texto vacío");
+                AccessibilityNodeInfo root = rootFor(disp(intent));
+                if (root == null) return CpRes.fail("no hay ventana activa");
+                AccessibilityNodeInfo target = findBestByText(root, txt);
+                if (target == null) return CpRes.fail("no se encontró el texto '" + txt + "'");
+                boolean ok = target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                if (!ok) {
+                    // Algunos nodos no aceptan ACTION_CLICK (TextView dentro de
+                    // una fila): se cae a un toque real en su centro.
+                    ok = tapCenter(target, disp(intent));
                 }
-                break;
+                Log.i(TAG, "click '" + txt + "' → " + ok);
+                return ok ? CpRes.ok("click '" + txt + "'") : CpRes.fail("el elemento '" + txt + "' no aceptó el click");
             }
             case ACTION_CLICK_ID: {
                 String rid = intent.getStringExtra("id");
-                if (rid != null && !rid.isEmpty()) {
-                    AccessibilityNodeInfo root = rootFor(disp(intent));
-                    if (root != null) {
-                        List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByViewId(rid);
-                        if (!nodes.isEmpty()) {
-                            boolean ok = nodes.get(0).performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                            Log.i(TAG, "click id=" + rid + " → " + ok);
-                        }
-                    }
-                }
-                break;
+                if (rid == null || rid.isEmpty()) return CpRes.fail("id vacío");
+                AccessibilityNodeInfo root = rootFor(disp(intent));
+                if (root == null) return CpRes.fail("no hay ventana activa");
+                List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByViewId(rid);
+                AccessibilityNodeInfo target = nodes.isEmpty() ? null : nodes.get(0);
+                // El snapshot muestra el id corto ("#skip_ad_button") pero
+                // findAccessibilityNodeInfosByViewId exige el completo
+                // ("pkg:id/skip_ad_button"): se acepta también el corto.
+                if (target == null) target = findByShortId(root, rid);
+                if (target == null) return CpRes.fail("no existe el id " + rid);
+                boolean ok = target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                if (!ok) ok = tapCenter(target, disp(intent));
+                Log.i(TAG, "click id=" + rid + " → " + ok);
+                return ok ? CpRes.ok("click " + rid) : CpRes.fail("el elemento " + rid + " no aceptó el click");
             }
             case ACTION_SCROLL_TO: {
                 String txt = intent.getStringExtra("text");
-                if (txt != null && !txt.isEmpty()) {
-                    AccessibilityNodeInfo root = rootFor(disp(intent));
-                    if (root != null) {
-                        AccessibilityNodeInfo target = findByText(root, txt);
-                        if (target != null) {
-                            boolean ok = target.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
-                            Log.i(TAG, "scrollTo '" + txt + "' → " + ok);
-                        }
-                    }
-                }
-                break;
+                if (txt == null || txt.isEmpty()) return CpRes.fail("texto vacío");
+                AccessibilityNodeInfo root = rootFor(disp(intent));
+                if (root == null) return CpRes.fail("no hay ventana activa");
+                AccessibilityNodeInfo target = findByText(root, txt);
+                if (target == null) return CpRes.fail("no se encontró el texto '" + txt + "'");
+                boolean ok = target.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
+                return ok ? CpRes.ok("scroll hasta '" + txt + "'") : CpRes.fail("no se pudo hacer scroll hasta '" + txt + "'");
             }
             case ACTION_GET_UI_TREE: {
-                List<String> lines = new ArrayList<>();
                 int d = disp(intent);
-                dumpAllWindows(lines, d);
-                if (lines.isEmpty()) {
-                    // SIEMPRE se escribe el fichero. Antes, un display sin
-                    // ventanas no escribía nada y el CLI se quejaba de que "el
-                    // servicio no responde", que es mentira y manda a debuggear
-                    // lo que no está roto.
-                    lines.add("# d" + d + ": " + (d == android.view.Display.DEFAULT_DISPLAY
-                        ? "sin ventana activa" : "sin ventanas propias (vacío)"));
+                List<Snap.Node> nodes = new ArrayList<>();
+                collect(d, nodes, System.currentTimeMillis() + DUMP_BUDGET_MS);
+                if (nodes.isEmpty()) {
+                    String mark = "# d" + d + ": " + (d == android.view.Display.DEFAULT_DISPLAY
+                        ? "sin ventana activa" : "sin ventanas propias (vacío)");
+                    return CpRes.empty(mark).withText(mark + "\n").withFile(treeFile(d));
                 }
-                if (lines.size() > 3500) lines = lines.subList(0, 3500);
-                try { saveToDownloads("accessdroid-tree.txt", "text/plain", joinLines(lines).getBytes("UTF-8")); }
-                catch (Exception e) { Log.w(TAG, "tree encode fail", e); }
-                break;
+                String tree = Snap.renderTree(pkgOf(d), nodes, d);
+                return CpRes.ok("árbol").withText(tree).withFile(treeFile(d));
+            }
+            case ACTION_GET_SNAPSHOT: {
+                int d = disp(intent);
+                boolean all = intent.getIntExtra("mode", 0) == 1;
+                String filter = intent.getStringExtra("filter");
+                List<Snap.Node> nodes = new ArrayList<>();
+                collect(d, nodes, System.currentTimeMillis() + DUMP_BUDGET_MS);
+                if (nodes.isEmpty()) {
+                    int dd = d;
+                    return CpRes.empty("Pantalla — display " + dd + ": vacío (sin ventanas propias). "
+                        + "El servicio va bien: no hay nada en esa pantalla todavía. "
+                        + "Lánzale algo con: amctl -d " + dd + " launch <pkg>");
+                }
+                List<Snap.Pick> picks = Snap.select(nodes, all, filter);
+                if (picks.isEmpty()) {
+                    return CpRes.empty("Pantalla: " + pkgOf(d) + " — sin elementos interactivos "
+                        + "(¿servicio activado / app >= v1.0.8?)");
+                }
+                String snapText = Snap.render(pkgOf(d), nodes, picks, all, d);
+                RefCache cache = new RefCache();
+                cache.display = d;
+                cache.allMode = all;
+                cache.picks = picks;
+                cache.stamp = System.currentTimeMillis();
+                refCache = cache;
+                uiDirty = false;
+                return CpRes.ok("snapshot").withText(snapText);
+            }
+            case ACTION_TAPREF: {
+                String ref = intent.getStringExtra("ref");
+                if (ref == null || ref.isEmpty()) return CpRes.fail("ref vacío");
+                return tapRef(ref, disp(intent));
+            }
+            case ACTION_WAITFOR: {
+                // Espera a que aparezca un elemento: el bucle va en el servicio,
+                // así que el agente no gasta ida y vuelta ni duerme a ciegas.
+                int d = disp(intent);
+                String needle = intent.getStringExtra("text");
+                long timeout = intent.getLongExtra("timeout", 5000);
+                boolean all = intent.getIntExtra("mode", 0) == 1;
+                if (needle == null || needle.isEmpty()) return CpRes.fail("texto vacío");
+                String n = needle.toLowerCase();
+                long deadline = System.currentTimeMillis() + Math.max(200, Math.min(timeout, 60000));
+                while (System.currentTimeMillis() < deadline) {
+                    List<Snap.Node> nodes = new ArrayList<>();
+                    collect(d, nodes, System.currentTimeMillis() + 1500);
+                    if (!nodes.isEmpty()) {
+                        // allMode=true: el waitfor tiene que ver también el texto
+                        // NO interactivo (títulos de reproductor, rótulos, celdas).
+                        List<Snap.Pick> picks = Snap.select(nodes, true, null);
+                        for (Snap.Pick p : picks) {
+                            String hay = (p.label + " " + p.node.vid).toLowerCase();
+                            if (!hay.contains(n)) continue;
+                            RefCache cache = new RefCache();
+                            cache.display = d;
+                            cache.allMode = true;
+                            cache.picks = picks;
+                            cache.stamp = System.currentTimeMillis();
+                            refCache = cache;
+                            uiDirty = false;
+                            return CpRes.ok("encontrado @" + p.ref)
+                                .withText(Snap.render(pkgOf(d), nodes, picks, true, d));
+                        }
+                    }
+                    try { Thread.sleep(120); } catch (InterruptedException e) { break; }
+                }
+                return CpRes.fail("timeout: '" + needle + "' no apareció en " + timeout + "ms");
             }
             case ACTION_SCREENDUMP: {
                 int displayId = intent.getIntExtra("displayId", android.view.Display.DEFAULT_DISPLAY);
-                if (Build.VERSION.SDK_INT >= 33) {
-                    try {
-                    takeScreenshot(displayId, getMainExecutor(),
-                        new TakeScreenshotCallback() {
-                            @Override
-                            public void onSuccess(ScreenshotResult r) {
-                                Log.i(TAG, "screenshot ok (displayId=" + displayId + ")");
-                                try {
-                                    android.graphics.Bitmap hw = android.graphics.Bitmap.wrapHardwareBuffer(r.getHardwareBuffer(), r.getColorSpace());
-                                    if (hw != null) {
-                                        android.graphics.Bitmap sw = hw.copy(android.graphics.Bitmap.Config.ARGB_8888, false);
-                                        hw.recycle();
-                                        if (sw != null) {
-                                            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-                                            sw.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, baos);
-                                            sw.recycle();
-                                            saveToDownloads(shotFile(displayId), "image/png", baos.toByteArray());
-                                            try {
-                                                getContentResolver().delete(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                                                    android.provider.MediaStore.Downloads.DISPLAY_NAME + "=?", new String[]{"accessdroid-shot-error.txt"});
-                                            } catch (Exception ignored) { }
-                                        }
-                                    }
-                                    try { r.getHardwareBuffer().close(); } catch (Exception ignored) { }
-                                } catch (Exception e) { Log.w(TAG, "screenshot save fail", e); }
-                                if (pendingCb != null) {
-                                    pendingCb.onResult(null);
-                                    pendingCb = null;
-                                }
-                            }
-                            @Override
-                            public void onFailure(int errCode) {
-                                Log.e(TAG, "screenshot fail: " + errCode + " (display " + displayId + ")");
-                                saveToDownloads("accessdroid-shot-error.txt", "text/plain",
-                                    ("display=" + displayId + " onFailure errCode=" + errCode).getBytes());
-                            }
-                        });
-                    } catch (Exception e) {
-                        Log.w(TAG, "takeScreenshot threw", e);
-                        try {
-                            saveToDownloads("accessdroid-shot-error.txt", "text/plain",
-                                ("display=" + displayId + " takeScreenshot threw: " + e).getBytes("UTF-8"));
-                        } catch (Exception ignored) { }
-                    }
-                } else {
-                    Log.w(TAG, "takeScreenshot requires API 33+");
+                float scale = intent.getFloatExtra("scale", 0f);
+                int quality = intent.getIntExtra("quality", 85);
+                boolean png = "png".equalsIgnoreCase(intent.getStringExtra("format"));
+                byte[] img = captureImage(displayId, scale, quality, png);
+                if (img == null) {
+                    return CpRes.fail("no se pudo capturar la pantalla (API 33+ requerido)")
+                        .withFile(FILE_SHOT_ERROR);
                 }
-                break;
+                String dims = imageSize(img, png);
+                return CpRes.ok("captura " + dims).withBinary(img)
+                    .withFile(png ? shotFile(displayId) : shotFileJpg(displayId));
             }
             case ACTION_PRESS_KEY: {
                 int keyCode = intent.getIntExtra("keyCode", 0);
@@ -394,9 +596,9 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                     case KeyEvent.KEYCODE_APP_SWITCH:  global = GLOBAL_ACTION_RECENTS; break;
                     case KeyEvent.KEYCODE_VOLUME_UP:   global = -2; break; // handled below
                     case KeyEvent.KEYCODE_VOLUME_DOWN: global = -3; break;
-                    default: 
+                    default:
                         Log.w(TAG, "unsupported keycode via a11y: " + keyCode);
-                        return;
+                        return CpRes.fail("keycode no soportado: " + keyCode);
                 }
                 if (global == -2 || global == -3) {
                     // Volume via audio manager fallback
@@ -406,11 +608,12 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                             if (global == -2) am.adjustStreamVolume(android.media.AudioManager.STREAM_MUSIC, android.media.AudioManager.ADJUST_RAISE, android.media.AudioManager.FLAG_SHOW_UI);
                             else am.adjustStreamVolume(android.media.AudioManager.STREAM_MUSIC, android.media.AudioManager.ADJUST_LOWER, android.media.AudioManager.FLAG_SHOW_UI);
                         }
+                        return CpRes.ok("volumen");
                     } catch (Exception e) { Log.w(TAG, "volume adjust fail", e); }
-                } else {
-                    performGlobalAction(global);
+                    return CpRes.fail("no se pudo ajustar el volumen");
                 }
-                break;
+                performGlobalAction(global);
+                return CpRes.ok("key " + keyCode);
             }
             case ACTION_PINCH: {
                 int dispId = disp(intent);
@@ -426,63 +629,64 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                         new GestureDescription.StrokeDescription(p1, 0, 400),
                         new GestureDescription.StrokeDescription(p2, 0, 400)), dispId);
                 run(gd, scale < 1 ? "pinchIn" : "pinchOut");
-                break;
+                return CpRes.ok("pinch");
             }
             case ACTION_DOUBLE_TAP: {
                 int x = intent.getIntExtra("x", -1);
                 int y = intent.getIntExtra("y", -1);
-                if (x < 0 || y < 0) return;
+                if (x < 0 || y < 0) return CpRes.fail("coordenadas inválidas");
                 Path p1 = new Path(); p1.moveTo(x, y);
                 GestureDescription.StrokeDescription s1 = new GestureDescription.StrokeDescription(p1, 0, 40);
                 Path p2 = new Path(); p2.moveTo(x, y);
                 GestureDescription.StrokeDescription s2 = new GestureDescription.StrokeDescription(p2, 120, 40);
                 GestureDescription gd = build(java.util.Arrays.asList(s1, s2), disp(intent));
                 run(gd, "doubleTap");
-                break;
+                return CpRes.ok("doble tap (" + x + "," + y + ")");
             }
             case ACTION_CLEAR_TEXT: {
                 AccessibilityNodeInfo f = focusIn(disp(intent));
-                if (f != null) {
-                    Bundle b = new Bundle();
-                    b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "");
-                    f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b);
-                }
-                break;
+                if (f == null) return CpRes.fail("no hay ningún campo de texto con el foco");
+                Bundle b = new Bundle();
+                b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "");
+                boolean ok = f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b);
+                return ok ? CpRes.ok("campo vaciado") : CpRes.fail("no se pudo vaciar el campo");
             }
             case ACTION_PASTE: {
                 AccessibilityNodeInfo f2 = focusIn(disp(intent));
-                if (f2 != null) f2.performAction(AccessibilityNodeInfo.ACTION_PASTE);
-                break;
+                if (f2 == null) return CpRes.fail("no hay ningún campo de texto con el foco");
+                boolean ok = f2.performAction(AccessibilityNodeInfo.ACTION_PASTE);
+                return ok ? CpRes.ok("pegado") : CpRes.fail("no se pudo pegar");
             }
             case ACTION_FOCUS: {
                 String txt = intent.getStringExtra("text");
                 String rid = intent.getStringExtra("id");
                 AccessibilityNodeInfo root = rootFor(disp(intent));
-                if (root == null) break;
+                if (root == null) return CpRes.fail("no hay ventana activa");
                 AccessibilityNodeInfo target = null;
                 if (txt != null && !txt.isEmpty()) target = findByText(root, txt);
                 else if (rid != null && !rid.isEmpty()) {
                     List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByViewId(rid);
                     if (!nodes.isEmpty()) target = nodes.get(0);
                 }
-                if (target != null) target.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
-                break;
+                if (target == null) return CpRes.fail("no se encontró el campo a enfocar");
+                boolean ok = target.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+                return ok ? CpRes.ok("foco puesto") : CpRes.fail("el campo no aceptó el foco");
             }
             case ACTION_NOTIFICATIONS:
                 performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS);
-                break;
+                return CpRes.ok("notificaciones");
             case ACTION_QUICK_SETTINGS:
                 performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS);
-                break;
+                return CpRes.ok("ajustes rápidos");
             case ACTION_LOCK:
-                if (Build.VERSION.SDK_INT >= 28) performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN);
-                break;
+                if (Build.VERSION.SDK_INT >= 28) { performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN); return CpRes.ok("bloqueo"); }
+                return CpRes.fail("requiere API 28+");
             case ACTION_SCREENSHOT:
-                if (Build.VERSION.SDK_INT >= 28) performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT);
-                break;
+                if (Build.VERSION.SDK_INT >= 28) { performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT); return CpRes.ok("captura del sistema"); }
+                return CpRes.fail("requiere API 28+");
             case ACTION_POWER:
-                if (Build.VERSION.SDK_INT >= 30) performGlobalAction(GLOBAL_ACTION_POWER_DIALOG);
-                break;
+                if (Build.VERSION.SDK_INT >= 30) { performGlobalAction(GLOBAL_ACTION_POWER_DIALOG); return CpRes.ok("diálogo de apagado"); }
+                return CpRes.fail("requiere API 30+");
             case ACTION_OPEN_SETTINGS: {
                 try {
                     String page = intent.getStringExtra("page");
@@ -495,8 +699,8 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     }
                     startActivity(launch);
-                } catch (Exception e) { Log.w(TAG, "openSettings fail", e); }
-                break;
+                    return CpRes.ok("ajustes");
+                } catch (Exception e) { Log.w(TAG, "openSettings fail", e); return CpRes.fail("no se pudieron abrir los ajustes"); }
             }
             case ACTION_START_ACTIVITY: {
                 try {
@@ -517,73 +721,89 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                         launch2 = new Intent();
                         launch2.setClassName(pkg, cls);
                     }
-                    if (launch2 != null) {
-                        launch2.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                        if (dispId != android.view.Display.DEFAULT_DISPLAY && Build.VERSION.SDK_INT >= 26) {
-                            // lanzar la app EN la pantalla virtual, no en la del usuario
-                            startActivity(launch2, android.app.ActivityOptions.makeBasic()
-                                .setLaunchDisplayId(dispId).toBundle());
-                        } else {
-                            startActivity(launch2);
-                        }
+                    if (launch2 == null) return CpRes.fail("no se pudo resolver la app a lanzar");
+                    launch2.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    if (dispId != android.view.Display.DEFAULT_DISPLAY && Build.VERSION.SDK_INT >= 26) {
+                        // lanzar la app EN la pantalla virtual, no en la del usuario
+                        startActivity(launch2, android.app.ActivityOptions.makeBasic()
+                            .setLaunchDisplayId(dispId).toBundle());
+                    } else {
+                        startActivity(launch2);
                     }
-                } catch (Exception e) { Log.w(TAG, "startActivity fail", e); }
-                break;
+                    return CpRes.ok("lanzada" + (pkg != null ? " " + pkg : ""));
+                } catch (Exception e) { Log.w(TAG, "startActivity fail", e); return CpRes.fail("no se pudo lanzar la app: " + e); }
             }
             case ACTION_OPEN_URI: {
                 try {
                     String uri = intent.getStringExtra("uri");
                     String mime = intent.getStringExtra("mime");
-                    if (uri != null) {
-                        int dispId = disp(intent);
-                        Intent open = new Intent(Intent.ACTION_VIEW);
-                        open.setData(android.net.Uri.parse(uri));
-                        if (mime != null && !mime.isEmpty()) open.setType(mime);
-                        open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    if (uri == null || uri.isEmpty()) return CpRes.fail("URL vacía");
+                    int dispId = disp(intent);
+                    Intent open = new Intent(Intent.ACTION_VIEW);
+                    open.setData(android.net.Uri.parse(uri));
+                    if (mime != null && !mime.isEmpty()) open.setType(mime);
+                    open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
 
-                        // El selector de apps ("Abrir con") es una activity del
-                        // SISTEMA y se abre siempre en el display 0: ignora
-                        // setLaunchDisplayId. Si la URL resuelve a una sola app,
-                        // la apuntamos directamente y así sí podemos dirigirla.
-                        boolean ambiguous = true;
+                    // El selector de apps ("Abrir con") es una activity del
+                    // SISTEMA y se abre siempre en el display 0: ignora
+                    // setLaunchDisplayId. Si la URL resuelve a una sola app,
+                    // la apuntamos directamente y así sí podemos dirigirla.
+                    boolean ambiguous = true;
+                    String pkg = intent.getStringExtra("package");
+                    if (pkg != null && !pkg.isEmpty()) {
+                        // navegador forzado (amctl openurl <url> <paquete>)
                         try {
-                            android.content.pm.ResolveInfo ri =
-                                getPackageManager().resolveActivity(open, 0);
-                            if (ri != null && ri.activityInfo != null
-                                    && !"android".equals(ri.activityInfo.packageName)) {
+                            Intent probe = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(uri));
+                            probe.setPackage(pkg);
+                            android.content.pm.ResolveInfo ri = getPackageManager().resolveActivity(probe, 0);
+                            if (ri != null && ri.activityInfo != null) {
                                 open.setComponent(new android.content.ComponentName(
                                     ri.activityInfo.packageName, ri.activityInfo.name));
                                 ambiguous = false;
+                            } else {
+                                return CpRes.fail("el paquete '" + pkg + "' no abre esa URL");
                             }
-                        } catch (Exception ignored) { }
-
-                        if (dispId != android.view.Display.DEFAULT_DISPLAY && ambiguous
-                                && Build.VERSION.SDK_INT >= 26) {
-                            try { saveToDownloads("accessdroid-error.txt", "text/plain",
-                                ("display=" + dispId + ": esa URL tiene varias apps y el selector del "
-                                 + "sistema se abrirá en la pantalla 0 (no admite display). "
-                                 + "Usa amctl -d " + dispId + " launch <paquete>").getBytes("UTF-8")); }
-                            catch (Exception ignored) { }
+                        } catch (Exception e) {
+                            return CpRes.fail("no se pudo forzar '" + pkg + "': " + e.getMessage());
                         }
-
-                        if (dispId != android.view.Display.DEFAULT_DISPLAY && Build.VERSION.SDK_INT >= 26) {
-                            startActivity(open, android.app.ActivityOptions.makeBasic()
-                                .setLaunchDisplayId(dispId).toBundle());
-                        } else {
-                            startActivity(open);
+                    } else try {
+                        android.content.pm.ResolveInfo ri =
+                            getPackageManager().resolveActivity(open, 0);
+                        if (ri != null && ri.activityInfo != null
+                                && !"android".equals(ri.activityInfo.packageName)) {
+                            open.setComponent(new android.content.ComponentName(
+                                ri.activityInfo.packageName, ri.activityInfo.name));
+                            ambiguous = false;
                         }
+                    } catch (Exception ignored) { }
+
+                    String warn = null;
+                    if (dispId != android.view.Display.DEFAULT_DISPLAY && ambiguous
+                            && Build.VERSION.SDK_INT >= 26) {
+                        warn = "display=" + dispId + ": esa URL tiene varias apps y el selector del "
+                             + "sistema se abrirá en la pantalla 0 (no admite display). "
+                             + "Usa amctl -d " + dispId + " launch <paquete>";
                     }
-                } catch (Exception e) { Log.w(TAG, "openUri fail", e); }
-                break;
+
+                    if (dispId != android.view.Display.DEFAULT_DISPLAY && Build.VERSION.SDK_INT >= 26) {
+                        startActivity(open, android.app.ActivityOptions.makeBasic()
+                            .setLaunchDisplayId(dispId).toBundle());
+                    } else {
+                        startActivity(open);
+                    }
+                    if (warn != null) {
+                        return CpRes.fail(warn).withFile(FILE_ERROR);
+                    }
+                    return CpRes.ok("url abierta");
+                } catch (Exception e) { Log.w(TAG, "openUri fail", e); return CpRes.fail("no se pudo abrir la URL: " + e); }
             }
             case ACTION_DISPLAY:
-                handleDisplayOp(intent);
-                break;
+                return handleDisplayOp(intent);
             case ACTION_DISPLAY_BACK: {
                 int dispId = disp(intent);
                 if (dispId == android.view.Display.DEFAULT_DISPLAY) {
                     performGlobalAction(GLOBAL_ACTION_BACK);
-                    break;
+                    return CpRes.ok("back");
                 }
                 // GLOBAL_ACTION_BACK siempre es del display 0: buscamos el botón
                 // de retroceso de la app en la pantalla virtual.
@@ -592,15 +812,257 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 if (btn != null) {
                     boolean ok = btn.performAction(AccessibilityNodeInfo.ACTION_CLICK);
                     Log.i(TAG, "back en display " + dispId + " → " + ok);
-                } else {
-                    Log.w(TAG, "sin botón atrás en display " + dispId);
-                    try { saveToDownloads("accessdroid-error.txt", "text/plain",
-                        ("display=" + dispId + ": la app no tiene botón de retroceso reconocible en ese display").getBytes("UTF-8")); }
-                    catch (Exception ignored) { }
+                    return ok ? CpRes.ok("back en display " + dispId) : CpRes.fail("el botón atrás no aceptó el click");
                 }
-                break;
+                Log.w(TAG, "sin botón atrás en display " + dispId);
+                return CpRes.fail("display=" + dispId
+                    + ": la app no tiene botón de retroceso reconocible en ese display")
+                    .withFile(FILE_ERROR);
+            }
+            default:
+                return CpRes.fail("acción desconocida: " + action);
+        }
+    }
+
+    /* -------------------------------------------------------------- */
+    /*                 Snapshot, refs y capturas (rápido)               */
+    /* -------------------------------------------------------------- */
+
+    /** Paquete de la ventana activa de un display (para las cabeceras). */
+    private String pkgOf(int displayId) {
+        AccessibilityNodeInfo root = rootFor(displayId);
+        if (root == null) return "";
+        CharSequence p = root.getPackageName();
+        return p == null ? "" : p.toString();
+    }
+
+    /**
+     * Recorre las ventanas del display y guarda los nodos con contenido.
+     * Con presupuesto de tiempo: una pantalla patológica no puede dejar el
+     * receptor de broadcast colgado (y por tanto matar la app).
+     */
+    private void collect(int displayId, List<Snap.Node> out, long deadline) {
+        AccessibilityNodeInfo root = rootFor(displayId);
+        if (root == null) return;
+        collectNode(root, 0, MAX_DEPTH, "", "", out, deadline);
+        List<AccessibilityWindowInfo> wins = windowsOf(displayId);
+        if (wins == null) return;
+
+        Rect mainRect = new Rect();
+        root.getBoundsInScreen(mainRect);
+        String mainPkg = String.valueOf(root.getPackageName());
+        for (int i = 0; i < wins.size(); i++) {
+            if (System.currentTimeMillis() > deadline) break;
+            AccessibilityWindowInfo aw = wins.get(i);
+            if (aw == null) continue;
+            if (aw.getDisplayId() != displayId) continue;   // ventanas de otra pantalla
+            AccessibilityNodeInfo wroot = null;
+            try { wroot = aw.getRoot(); } catch (Exception e) { continue; }
+            if (wroot == null) continue;
+            Rect wr = new Rect();
+            wroot.getBoundsInScreen(wr);
+            String wpkg = String.valueOf(wroot.getPackageName());
+            if (wr.equals(mainRect) && wpkg.equals(mainPkg)) continue;
+            String kind = windowTag(aw.getType());
+            if (kind == null) continue;   // TYPE_APPLICATION duplicada: omitir
+            collectNode(wroot, 0, MAX_DEPTH, kind, wpkg, out, deadline);
+        }
+    }
+
+    private void collectNode(AccessibilityNodeInfo node, int depth, int maxDepth,
+                             String win, String winPkg, List<Snap.Node> out, long deadline) {
+        if (depth > maxDepth || node == null) return;
+        if (out.size() >= MAX_NODES) return;
+        Rect r = new Rect();
+        node.getBoundsInScreen(r);
+        CharSequence txt = node.getText();
+        CharSequence desc = node.getContentDescription();
+        String vid = node.getViewIdResourceName();
+        int cc = node.getChildCount();
+        boolean meaningful = (txt != null && txt.length() > 0)
+                || (desc != null && desc.length() > 0)
+                || vid != null
+                || (cc == 0 && !r.isEmpty());
+        if (meaningful) {
+            Snap.Node n = new Snap.Node();
+            n.depth = depth;
+            String cls = node.getClassName() != null ? node.getClassName().toString() : "";
+            n.cls = cls.contains(".") ? cls.substring(cls.lastIndexOf('.') + 1) : cls;
+            n.vid = vid == null ? "" : vid;
+            n.txt = txt == null ? "" : txt.toString();
+            n.desc = desc == null ? "" : desc.toString();
+            n.l = r.left; n.t = r.top; n.r = r.right; n.b = r.bottom;
+            n.clk = node.isClickable();
+            n.scr = node.isScrollable();
+            n.edt = node.isEditable();
+            n.chk = node.isCheckable();
+            n.foc = node.isFocused();
+            n.win = win;
+            n.winPkg = winPkg;
+            out.add(n);
+        }
+        for (int i = 0; i < cc; i++) {
+            if ((i & 0x1f) == 0 && System.currentTimeMillis() > deadline) return;
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child == null) continue;
+            collectNode(child, depth + 1, maxDepth, win, winPkg, out, deadline);
+            try { child.recycle(); } catch (Exception ignored) { }
+        }
+    }
+
+    /**
+     * Toca la referencia @pN del último snapshot.
+     *
+     * Si la UI no ha cambiado desde el snapshot, se toca directamente la
+     * posición conocida (una orden, sin recorrer el árbol). Si ha cambiado, se
+     * busca el elemento equivalente en el árbol actual; si ya no existe, se
+     * avisa en vez de tocar una posición equivocada.
+     */
+    private CpRes tapRef(String ref, int displayId) {
+        if (ref.startsWith("@")) ref = ref.substring(1);
+        if (!ref.startsWith("p")) ref = "p" + ref;
+        RefCache cache = refCache;
+        if (cache == null || cache.picks.isEmpty()) {
+            return CpRes.fail("no hay snapshot: ejecuta primero 'amctl snap'");
+        }
+        if (cache.display != displayId) {
+            return CpRes.fail("la ref @" + ref + " es de otro display (usa -d " + cache.display + ")");
+        }
+        int idx = -1;
+        for (int i = 0; i < cache.picks.size(); i++) {
+            if (cache.picks.get(i).ref.equals(ref)) { idx = i; break; }
+        }
+        if (idx < 0) {
+            return CpRes.fail("ref @" + ref + " no existe — ejecuta: amctl snap");
+        }
+        Snap.Pick pick = cache.picks.get(idx);
+
+        int x = pick.node.cx();
+        int y = pick.node.cy();
+        boolean resolved = false;
+
+        if (uiDirty) {
+            // La pantalla ha cambiado: re-buscamos el mismo elemento.
+            List<Snap.Node> nodes = new ArrayList<>();
+            collect(displayId, nodes, System.currentTimeMillis() + DUMP_BUDGET_MS);
+            if (nodes.isEmpty()) {
+                return CpRes.fail("ref @" + ref + " obsoleta: la pantalla está vacía — re-snapshot");
+            }
+            List<Snap.Pick> fresh = Snap.select(nodes, cache.allMode, null);
+            Snap.Pick best = matchPick(pick, fresh);
+            if (best == null) {
+                return CpRes.fail("ref @" + ref + " obsoleta (la pantalla cambió) — re-snapshot");
+            }
+            x = best.node.cx();
+            y = best.node.cy();
+            resolved = true;
+        }
+
+        run(makeTap(x, y, 80L, displayId), "tapref");
+        return CpRes.ok("tap @" + ref + " -> (" + x + "," + y + ")" + (resolved ? " [re-resuelto]" : ""));
+    }
+
+    /** Busca en los elementos frescos el equivalente al de la ref. */
+    private Snap.Pick matchPick(Snap.Pick old, List<Snap.Pick> fresh) {
+        Snap.Pick byLabel = null;
+        Snap.Pick byId = null;
+        for (Snap.Pick p : fresh) {
+            boolean sameLabel = p.label.equals(old.label);
+            boolean sameId = !old.node.vid.isEmpty() && old.node.vid.equals(p.node.vid);
+            if (sameLabel && sameId) return p;
+            if (sameId && byId == null) byId = p;
+            if (sameLabel && byLabel == null) byLabel = p;
+        }
+        if (byId != null) return byId;
+        if (byLabel != null) return byLabel;
+        return null;
+    }
+
+    /**
+     * Captura la pantalla en JPEG. El PNG a calidad máxima tardaba segundos en
+     * comprimirse y ocupaba cientos de KB; el JPEG es ~10x más rápido de
+     * producir y suficiente para leer la pantalla.
+     */
+    private byte[] captureImage(int displayId, float scale, int quality, boolean png) {
+        if (Build.VERSION.SDK_INT < 33) {
+            Log.w(TAG, "takeScreenshot requires API 33+");
+            return null;
+        }
+        final Object lock = new Object();
+        final android.graphics.Bitmap[] holder = new android.graphics.Bitmap[1];
+        final boolean[] done = new boolean[1];
+        try {
+            takeScreenshot(displayId, getMainExecutor(), new TakeScreenshotCallback() {
+                @Override public void onSuccess(ScreenshotResult r) {
+                    try {
+                        // envolver el buffer es barato; la copia y el JPEG
+                        // se hacen en el hilo de trabajo, no en el principal.
+                        holder[0] = android.graphics.Bitmap.wrapHardwareBuffer(
+                            r.getHardwareBuffer(), r.getColorSpace());
+                    } catch (Exception e) { Log.w(TAG, "wrapHB failed", e); }
+                    try { r.getHardwareBuffer().close(); } catch (Exception ignored) { }
+                    synchronized (lock) { done[0] = true; lock.notifyAll(); }
+                }
+                @Override public void onFailure(int errCode) {
+                    Log.e(TAG, "screenshot fail: " + errCode + " (display " + displayId + ")");
+                    synchronized (lock) { done[0] = true; lock.notifyAll(); }
+                }
+            });
+        } catch (Exception e) {
+            Log.w(TAG, "takeScreenshot threw", e);
+            return null;
+        }
+        synchronized (lock) {
+            long deadline = System.currentTimeMillis() + 8000;
+            while (!done[0] && System.currentTimeMillis() < deadline) {
+                try { lock.wait(50); } catch (InterruptedException e) { break; }
             }
         }
+        android.graphics.Bitmap hw = holder[0];
+        if (hw == null) return null;
+        try {
+            android.graphics.Bitmap sw = hw.copy(android.graphics.Bitmap.Config.ARGB_8888, false);
+            if (sw == null) return null;
+            android.graphics.Bitmap out = sw;
+            if (scale > 0.01f && scale < 0.99f) {
+                int nw = Math.max(1, Math.round(sw.getWidth() * scale));
+                int nh = Math.max(1, Math.round(sw.getHeight() * scale));
+                out = android.graphics.Bitmap.createScaledBitmap(sw, nw, nh, true);
+            }
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            out.compress(png ? android.graphics.Bitmap.CompressFormat.PNG
+                             : android.graphics.Bitmap.CompressFormat.JPEG, quality, baos);
+            if (out != sw) out.recycle();
+            sw.recycle();
+            return baos.toByteArray();
+        } catch (Exception e) {
+            Log.w(TAG, "screenshot encode fail", e);
+            return null;
+        } finally {
+            try { hw.recycle(); } catch (Exception ignored) { }
+        }
+    }
+
+    /** Dimensiones de una imagen JPEG (para el escalado de tapshot). */
+    private String imageSize(byte[] jpg, boolean png) {
+        if (png) return "png";
+        try {
+            int i = 2;
+            while (i < jpg.length - 9) {
+                if ((jpg[i] & 0xFF) != 0xFF) { i++; continue; }
+                int marker = jpg[i + 1] & 0xFF;
+                int len = ((jpg[i + 2] & 0xFF) << 8) | (jpg[i + 3] & 0xFF);
+                boolean sof = (marker >= 0xC0 && marker <= 0xCF
+                        && marker != 0xC4 && marker != 0xC8 && marker != 0xCC);
+                if (sof) {
+                    int h = ((jpg[i + 5] & 0xFF) << 8) | (jpg[i + 6] & 0xFF);
+                    int w = ((jpg[i + 7] & 0xFF) << 8) | (jpg[i + 8] & 0xFF);
+                    return w + "x" + h;
+                }
+                i += 2 + len;
+            }
+        } catch (Exception e) { /* sin dimensiones */ }
+        return "?";
     }
 
     /* -------------------------------------------------------------- */
@@ -769,8 +1231,49 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 getPackageName()) == android.content.pm.PackageManager.PERMISSION_GRANTED;
     }
 
-    /** Reporta todos los displays (id, tamaño, dpi, ventanas) a /sdcard/Download. */
-    private void saveDisplays(String errorLine) {
+    /**
+     * Activa el propio servicio de accesibilidad escribiendo el ajuste seguro.
+     *
+     * Android desactiva el servicio de accesibilidad cada vez que se actualiza
+     * la app, y normally eso obliga a ir a Ajustes a tocar el interruptor. Si
+     * la app tiene WRITE_SECURE_SETTINGS (se concede una vez por adb), puede
+     * restaurarse sola. No hace nada más: solo se activa a sí misma.
+     */
+    static CpRes enableSelf(Context ctx) {
+        try {
+            if (ctx.getPackageManager().checkPermission("android.permission.WRITE_SECURE_SETTINGS",
+                    ctx.getPackageName()) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                return CpRes.fail("no puedo activarme solo: falta WRITE_SECURE_SETTINGS. "
+                    + "Concede una vez con: adb shell pm grant com.accessdroid.termux "
+                    + "android.permission.WRITE_SECURE_SETTINGS — o actívalo en "
+                    + "Ajustes → Accesibilidad → CostPhone");
+            }
+            String comp = ctx.getPackageName() + "/" + AccessibilityServiceImpl.class.getName();
+            String cur = android.provider.Settings.Secure.getString(ctx.getContentResolver(),
+                android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+            StringBuilder sb = new StringBuilder();
+            if (cur != null && !cur.isEmpty()) {
+                for (String s : cur.split(":")) {
+                    String t = s.trim();
+                    if (t.isEmpty() || t.equalsIgnoreCase(comp)) continue;
+                    if (sb.length() > 0) sb.append(":");
+                    sb.append(t);
+                }
+            }
+            if (sb.length() > 0) sb.append(":");
+            sb.append(comp);
+            android.provider.Settings.Secure.putString(ctx.getContentResolver(),
+                android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, sb.toString());
+            android.provider.Settings.Secure.putInt(ctx.getContentResolver(),
+                android.provider.Settings.Secure.ACCESSIBILITY_ENABLED, 1);
+            return CpRes.ok("servicio activado (tarda unos segundos en conectar)");
+        } catch (Exception e) {
+            return CpRes.fail("no se pudo activar: " + e);
+        }
+    }
+
+    /** Reporta todos los displays (id, tamaño, dpi, ventanas) como texto. */
+    private String buildDisplaysReport(String errorLine) {
         List<String> out = new ArrayList<>();
         if (errorLine != null) out.add("error=" + errorLine);
 
@@ -804,9 +1307,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         try { raw = android.provider.Settings.Global.getString(getContentResolver(), SETTING_OVERLAY_DISPLAYS); }
         catch (Exception ignored) { }
         out.add("overlay=" + (raw == null || raw.isEmpty() ? "none" : raw));
-        try {
-            saveToDownloads(FILE_DISPLAYS, "text/plain", joinLines(out).getBytes("UTF-8"));
-        } catch (Exception e) { Log.w(TAG, "displays encode fail", e); }
+        return joinLines(out);
     }
 
     private android.util.SparseArray<List<AccessibilityWindowInfo>> allDisplays() {
@@ -819,22 +1320,23 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         return a == null ? 0 : a.size();
     }
 
-    private void handleDisplayOp(Intent intent) {
+    private CpRes handleDisplayOp(Intent intent) {
         String op = intent.getStringExtra("op");
         if (op == null || op.isEmpty()) op = "status";
-        if ("status".equals(op)) { saveDisplays(null); return; }
+        if ("status".equals(op)) {
+            return CpRes.ok("displays").withText(buildDisplaysReport(null)).withFile(FILE_DISPLAYS);
+        }
 
         if (!canWriteSettings()) {
-            saveDisplays("WRITE_SECURE_SETTINGS no concedido a CostPhone. Concede una vez con: "
-                + "adb shell pm grant com.accessdroid.termux android.permission.WRITE_SECURE_SETTINGS");
-            return;
+            String msg = "WRITE_SECURE_SETTINGS no concedido a CostPhone. Concede una vez con: "
+                + "adb shell pm grant com.accessdroid.termux android.permission.WRITE_SECURE_SETTINGS";
+            return CpRes.fail(msg).withText(buildDisplaysReport(msg)).withFile(FILE_DISPLAYS);
         }
         if ("off".equals(op)) {
             // borrar el ajuste apaga todas las pantallas virtuales
             android.provider.Settings.Global.putString(getContentResolver(), SETTING_OVERLAY_DISPLAYS, null);
             Log.i(TAG, "pantalla virtual apagada");
-            saveDisplays(null);
-            return;
+            return CpRes.ok("apagada").withText(buildDisplaysReport(null)).withFile(FILE_DISPLAYS);
         }
         if ("on".equals(op)) {
             int w = intent.getIntExtra("width", 1080);
@@ -844,8 +1346,8 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             // overlay_display_devices NO es JSON:
             //   [ancho]x[alto]/[dpi][,flag1][,flag2];[display2];...
             if (w < 100 || w > 4096 || h < 100 || h > 4096 || dpi < 120 || dpi > 640) {
-                saveDisplays("fuera de rango (100-4096 px, 120-640 dpi): " + w + "x" + h + "@" + dpi);
-                return;
+                String msg = "fuera de rango (100-4096 px, 120-640 dpi): " + w + "x" + h + "@" + dpi;
+                return CpRes.fail(msg).withText(buildDisplaysReport(msg)).withFile(FILE_DISPLAYS);
             }
 
             // Flags: allowlist estricta. Un flag desconocido hace fallar TODO el
@@ -860,9 +1362,9 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                     if (f.isEmpty()) continue;
                     if (f.equals("mirror")) { mirror = true; continue; }  // pseudo-flag, no va al ajuste
                     if (!OVERLAY_FLAGS.contains(f)) {
-                        saveDisplays("flag no soportado: '" + f + "'. Válidos: "
-                            + String.join(", ", OVERLAY_FLAGS) + " (o 'mirror')");
-                        return;
+                        String msg = "flag no soportado: '" + f + "'. Válidos: "
+                            + String.join(", ", OVERLAY_FLAGS) + " (o 'mirror')";
+                        return CpRes.fail(msg).withText(buildDisplaysReport(msg)).withFile(FILE_DISPLAYS);
                     }
                     flags.add(f);
                 }
@@ -882,16 +1384,19 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             try {
                 android.provider.Settings.Global.putString(getContentResolver(), SETTING_OVERLAY_DISPLAYS, value);
                 Log.i(TAG, "pantalla virtual pedida: " + value);
-                saveDisplays(mirror
+                String warn = mirror
                     ? "aviso: modo espejo (sin own_content_only). El overlay muestra d0 y el "
                       + "agente puede escribir en la pantalla del usuario: úsalo solo para mirar."
-                    : null);
+                    : null;
+                return CpRes.ok("pantalla virtual encendida")
+                    .withText(buildDisplaysReport(warn)).withFile(FILE_DISPLAYS);
             } catch (Exception e) {
-                saveDisplays("fallo al escribir overlay_display_devices: " + e);
+                String msg = "fallo al escribir overlay_display_devices: " + e;
+                return CpRes.fail(msg).withText(buildDisplaysReport(msg)).withFile(FILE_DISPLAYS);
             }
-            return;
         }
-        saveDisplays("op desconocido: " + op);
+        String msg = "op desconocido: " + op;
+        return CpRes.fail(msg).withText(buildDisplaysReport(msg)).withFile(FILE_DISPLAYS);
     }
 
     /* -------------------------------------------------------------- */
@@ -941,6 +1446,55 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         return build(java.util.Arrays.asList(new GestureDescription.StrokeDescription(p, 0, 200)), displayId);
     }
 
+    /**
+     * Scroll semántico: pide a la app que desplace su lista (ACTION_SCROLL_*).
+     *
+     * El gesto rápido (flick) de 200 ms en el centro de la pantalla a veces lo
+     * intercepta el sistema (panel de notificaciones) y el scroll acaba en
+     * System UI. Con la acción semántica no hay gesto que robar: la app mueve
+     * su propio contenido. Si no hay nodo scrolleable, se cae al gesto.
+     */
+    private boolean scrollSemantic(int x, int y, boolean down, int displayId) {
+        AccessibilityNodeInfo root = rootFor(displayId);
+        if (root == null) return false;
+        List<AccessibilityNodeInfo> scrollables = new ArrayList<>();
+        collectScrollables(root, scrollables);
+        if (scrollables.isEmpty()) return false;
+        // el que contenga el punto pedido; si ninguno, el de mayor área
+        AccessibilityNodeInfo pick = null;
+        long bestArea = -1;
+        for (AccessibilityNodeInfo n : scrollables) {
+            android.graphics.Rect r = new android.graphics.Rect();
+            n.getBoundsInScreen(r);
+            boolean hit = r.contains(x, y);
+            long area = (long) r.width() * r.height();
+            if (hit) { pick = n; break; }
+            if (area > bestArea) { bestArea = area; pick = n; }
+        }
+        if (pick == null) return false;
+        int action = down ? AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                          : AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD;
+        try {
+            return pick.performAction(action);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void collectScrollables(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> out) {
+        if (node == null) return;
+        try {
+            if (node.isScrollable()) out.add(node);
+        } catch (Exception e) { /* sigue */ }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                collectScrollables(child, out);
+                child.recycle();
+            }
+        }
+    }
+
     public void typeText(String text) {
         Bundle args = new Bundle();
         args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
@@ -954,6 +1508,157 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         }
     }
 
+    /* -------------------------------------------------------------- */
+    /*             escritura por teclado en pantalla (IME)             */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Escribe el texto pulsando las teclas del teclado en pantalla.
+     *
+     * Los inputs web/React (Biblioteca de Anuncios de Meta, ciertas WebViews)
+     * rechazan ACTION_SET_TEXT, pero el teclado en pantalla sí entrega los
+     * caracteres: es la vía que funciona en universal.
+     */
+    private boolean typeWithIme(String text, int displayId) {
+        java.util.Map<String, AccessibilityNodeInfo> keys = imeKeys(displayId);
+        if (keys.isEmpty()) {
+            // Algunas apps (WebView con ALWAYS_HIDDEN) no levantan el teclado
+            // al tocar el campo: se fuerza a mostrarlo.
+            try {
+                android.view.inputmethod.InputMethodManager imm =
+                    (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (imm != null) imm.toggleSoftInput(0, 0);
+            } catch (Exception ignored) { }
+            nap(700);
+            keys = imeKeys(displayId);
+        }
+        if (keys.isEmpty()) return false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\n' || c == '\t' || c == '\r') continue;
+            AccessibilityNodeInfo key = null;
+            if (c == ' ') {
+                key = lookup(keys, " ", "espacio", "space");
+            } else {
+                key = keys.get(String.valueOf(c));
+                if (key == null && Character.isUpperCase(c)) {
+                    AccessibilityNodeInfo shift = findShiftKey(keys);
+                    if (shift != null) {
+                        tapNode(shift, displayId);
+                        nap(140);
+                        keys = imeKeys(displayId);
+                        key = keys.get(String.valueOf(c));
+                    }
+                }
+                if (key == null) key = keys.get(String.valueOf(Character.toLowerCase(c)));
+            }
+            if (key == null) {
+                Log.w(TAG, "typeWithIme: no hay tecla para '" + c + "'");
+                return false;
+            }
+            if (!tapNode(key, displayId)) return false;
+            nap(90);
+        }
+        return true;
+    }
+
+    /** Mapa etiqueta -> tecla del teclado en pantalla. */
+    private java.util.Map<String, AccessibilityNodeInfo> imeKeys(int displayId) {
+        java.util.HashMap<String, AccessibilityNodeInfo> map = new java.util.HashMap<>();
+        List<AccessibilityWindowInfo> wins = getWindows();
+        for (int i = 0; i < wins.size(); i++) {
+            AccessibilityWindowInfo w = wins.get(i);
+            if (w == null) continue;
+            AccessibilityNodeInfo root;
+            try { root = w.getRoot(); } catch (Exception e) { continue; }
+            if (root == null) continue;
+            String cn = String.valueOf(root.getClassName());
+            boolean isIme = cn.contains("inputmethodservice")
+                    || (w.getType() == AccessibilityWindowInfo.TYPE_INPUT_METHOD);
+            if (!isIme) continue;
+            collectImeKeys(root, map, 0);
+        }
+        return map;
+    }
+
+    private void collectImeKeys(AccessibilityNodeInfo node,
+                                java.util.Map<String, AccessibilityNodeInfo> map, int depth) {
+        if (node == null || depth > 14) return;
+        String cn = String.valueOf(node.getClassName());
+        if (cn.contains("KeyboardKey")) {
+            CharSequence t = node.getText();
+            if (t != null && t.length() > 0) map.put(t.toString(), node);
+            CharSequence d = node.getContentDescription();
+            if (d != null && d.length() > 0) map.put(d.toString(), node);
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo c = node.getChild(i);
+            if (c == null) continue;
+            collectImeKeys(c, map, depth + 1);
+        }
+    }
+
+    private AccessibilityNodeInfo findShiftKey(java.util.Map<String, AccessibilityNodeInfo> keys) {
+        String[] cand = {"Shift", "⇧", "MAYÚSCULAS", "Mayusculas", "shift"};
+        for (int i = 0; i < cand.length; i++) {
+            AccessibilityNodeInfo n = keys.get(cand[i]);
+            if (n != null) return n;
+        }
+        for (java.util.Map.Entry<String, AccessibilityNodeInfo> e : keys.entrySet()) {
+            if (e.getKey().toLowerCase().contains("shift")) return e.getValue();
+        }
+        return null;
+    }
+
+    private AccessibilityNodeInfo lookup(java.util.Map<String, AccessibilityNodeInfo> keys, String... names) {
+        for (int i = 0; i < names.length; i++) {
+            AccessibilityNodeInfo n = keys.get(names[i]);
+            if (n != null) return n;
+        }
+        return null;
+    }
+
+    /** Toca un nodo: primero ACTION_CLICK y, si no, gesto en su centro. */
+    private boolean tapNode(AccessibilityNodeInfo node, int displayId) {
+        if (node == null) return false;
+        try {
+            if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+        } catch (Exception ignored) { }
+        Rect b = new Rect();
+        try { node.getBoundsInScreen(b); } catch (Exception e) { return false; }
+        if (b.width() <= 0 || b.height() <= 0) return false;
+        run(makeTap(b.centerX(), b.centerY(), 40, displayId), "imekey");
+        return true;
+    }
+
+    private void nap(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException ignored) { }
+    }
+
+    /**
+     * ¿El campo muestra de verdad el texto escrito?
+     *
+     * Necesario porque ACTION_SET_TEXT puede devolver true sin escribir nada
+     * (combobox de categorías, inputs React): el agente se creería que escribió
+     * y seguiría con una pantalla que no cambió.
+     */
+    private boolean textLanded(AccessibilityNodeInfo node, String text) {
+        if (node == null) return false;
+        String shown = null;
+        try {
+            CharSequence t = node.getText();
+            if (t != null) shown = t.toString();
+            if ((shown == null || shown.isEmpty()) && node.isEditable()) {
+                CharSequence d = node.getContentDescription();
+                if (d != null) shown = d.toString();
+            }
+        } catch (Exception e) { return false; }
+        if (shown == null) return false;
+        String a = shown.trim().toLowerCase();
+        String b = text.trim().toLowerCase();
+        return a.contains(b) || b.contains(a);
+    }
+
     public void pressBack()  { performGlobalAction(GLOBAL_ACTION_BACK); }
     public void pressHome()  { performGlobalAction(GLOBAL_ACTION_HOME); }
     public void pressRecents() { performGlobalAction(GLOBAL_ACTION_RECENTS); }
@@ -961,44 +1666,6 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     /* -------------------------------------------------------------- */
     /*                      UI-tree / find helpers                    */
     /* -------------------------------------------------------------- */
-
-    /** Dump main window + IME/overlay windows: keyboard and floating toolbars
-     *  become part of the tree (amctl-snap tags them [ime]/[ovl]/[sys]).
-     *  Con displayId != 0 solo se vuelca ese display (pantalla virtual). */
-    private void dumpAllWindows(List<String> out, int displayId) {
-        AccessibilityNodeInfo root = rootFor(displayId);
-        if (root == null) return;
-        out.add("# display=" + displayId);
-        out.add("# pkg=" + root.getPackageName());
-        dumpNode(root, out, 0, 25);
-        Log.d(TAG, "root window: " + root.getPackageName() + " (display " + displayId + ")");
-
-        List<AccessibilityWindowInfo> wins = windowsOf(displayId);
-        if (wins == null) return;
-
-        Rect mainRect = new Rect();
-        root.getBoundsInScreen(mainRect);
-        String mainPkg = String.valueOf(root.getPackageName());
-        for (int i = 0; i < wins.size(); i++) {
-            AccessibilityWindowInfo aw = wins.get(i);
-            if (aw == null) continue;
-            if (aw.getDisplayId() != displayId) continue;   // ventanas de otra pantalla
-            AccessibilityNodeInfo wroot = null;
-            try { wroot = aw.getRoot(); } catch (Exception e) { continue; }
-            if (wroot == null) continue;
-            // skip: root window itself (same pkg + same screen bounds)
-            Rect wr = new Rect();
-            wroot.getBoundsInScreen(wr);
-            String wpkg = String.valueOf(wroot.getPackageName());
-            if (wr.equals(mainRect) && wpkg.equals(mainPkg)) continue;
-            String kind = windowTag(aw.getType());
-            if (kind == null) continue;   // TYPE_APPLICATION duplicada: omitir
-            out.add("# win=" + kind + " pkg=" + wpkg);
-            int before = out.size();
-            dumpNode(wroot, out, 0, 25);
-            Log.d(TAG, "extra window " + kind + " nodes=" + (out.size() - before));
-        }
-    }
 
     private String windowTag(int type) {
         switch (type) {
@@ -1018,7 +1685,6 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         }
         return sb.toString();
     }
-
     private AccessibilityNodeInfo findByText(AccessibilityNodeInfo node, String text) {
         if (node == null) return null;
         CharSequence cs = node.getText();
@@ -1038,34 +1704,111 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         return null;
     }
 
-    private void dumpNode(AccessibilityNodeInfo node, List<String> out, int depth, int maxDepth) {
-        if (depth > maxDepth || node == null) return;
-        Rect r = new Rect();
-        node.getBoundsInScreen(r);
-        CharSequence txt = node.getText();
+    /**
+     * Como findByText, pero eligiendo el nodo MÁS ESPECÍFICO.
+     *
+     * findByText devuelve el primer match en pre-orden, y ese casi siempre es
+     * el contenedor: un overlay de YouTube con el texto de sus hijos
+     * concatenados ("Saltar anuncio · Saltar · Patrocinado…"). El clic caía
+     * en el padre y no hacía nada. Aquí se puntúa cada coincidencia y gana la
+     * más concreta: texto propio exacto, nodo pulsable y más profundo.
+     */
+    private AccessibilityNodeInfo findBestByText(AccessibilityNodeInfo root, String text) {
+        List<AccessibilityNodeInfo> hits = new ArrayList<>();
+        collectTextHits(root, text, hits);
+        if (hits.isEmpty()) return null;
+        // Prioridad: si hay algún nodo PULSABLE que coincide, se elige entre
+        // esos (un TextView con el texto exacto no es pulsable: su ACTION_CLICK
+        // se rechaza). Entre los pulsables gana el texto más exacto y el más
+        // profundo. Sin pulsables, el de texto más exacto.
+        List<AccessibilityNodeInfo> pool = new ArrayList<>();
+        for (AccessibilityNodeInfo n : hits) {
+            try { if (n.isClickable() && n.isEnabled()) pool.add(n); } catch (Exception e) { }
+        }
+        if (pool.isEmpty()) pool = hits;
+        AccessibilityNodeInfo best = null;
+        int bestScore = Integer.MIN_VALUE;
+        for (AccessibilityNodeInfo n : pool) {
+            int score = 0;
+            CharSequence own = n.getText();
+            String ownTxt = own == null ? "" : own.toString().trim();
+            if (ownTxt.equalsIgnoreCase(text)) score += 100;          // texto propio exacto
+            else if (!ownTxt.isEmpty() && ownTxt.toLowerCase().contains(text.toLowerCase())) score += 50;
+            score += Math.min(20, depthOf(n));                          // más profundo = más concreto
+            if (score > bestScore) { bestScore = score; best = n; }
+        }
+        return best;
+    }
+
+    private void collectTextHits(AccessibilityNodeInfo node, String text, List<AccessibilityNodeInfo> out) {
+        if (node == null) return;
+        CharSequence cs = node.getText();
         CharSequence desc = node.getContentDescription();
-        String vid = node.getViewIdResourceName();
-        int cc = node.getChildCount();
-        boolean meaningful = (txt != null && txt.length() > 0)
-                || (desc != null && desc.length() > 0)
-                || vid != null
-                || (cc == 0 && !r.isEmpty());
-        if (meaningful) {
-            String indent = new String(new char[depth]).replace("\0", "  ");
-            String cls = node.getClassName() != null ? node.getClassName().toString() : "";
-            String shortClass = cls.contains(".") ? cls.substring(cls.lastIndexOf('.') + 1) : cls;
-            StringBuilder flags = new StringBuilder();
-            if (node.isClickable()) flags.append(" clk=1");
-            if (node.isScrollable()) flags.append(" scr=1");
-            if (node.isEditable()) flags.append(" edt=1");
-            if (node.isCheckable()) flags.append(" chk=1");
-            if (node.isFocused()) flags.append(" foc=1");
-            out.add(String.format("%s[%s] id=%s bounds=%s txt=%s desc=%s%s",
-                indent, shortClass, vid, r,
-                txt == null ? "" : txt, desc == null ? "" : desc, flags));
+        if ((cs != null && cs.toString().contains(text)) ||
+            (desc != null && desc.toString().contains(text))) {
+            out.add(node);
         }
-        for (int i = 0; i < cc; i++) {
-            dumpNode(node.getChild(i), out, depth + 1, maxDepth);
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                collectTextHits(child, text, out);
+                child.recycle();
+            }
         }
+    }
+
+    /** Toque real en el centro de un nodo (fallback de ACTION_CLICK). */
+    private boolean tapCenter(AccessibilityNodeInfo n, int displayId) {
+        try {
+            android.graphics.Rect r = new android.graphics.Rect();
+            n.getBoundsInScreen(r);
+            if (r.isEmpty()) return false;
+            int cx = r.centerX(), cy = r.centerY();
+            run(makeTap(cx, cy, 60, displayId), "tapCenter");
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private int depthOf(AccessibilityNodeInfo n) {        int d = 0;
+        AccessibilityNodeInfo p = n.getParent();
+        while (p != null && d < 30) { d++; p = p.getParent(); }
+        return d;
+    }
+
+    /**
+     * Busca un nodo por el id corto que muestra el snapshot ("#skip_ad_button")
+     * o por el completo ("pkg:id/skip_ad_button"). Devuelve el más profundo
+     * (el botón concreto) y no el contenedor que concatena el texto de sus
+     * hijos, que es donde suelen fallar los clics por texto.
+     */
+    private AccessibilityNodeInfo findByShortId(AccessibilityNodeInfo node, String wanted) {
+        if (node == null) return null;
+        String w = wanted.toLowerCase();
+        int slash = w.lastIndexOf('/');
+        String shortId = slash >= 0 ? w.substring(slash + 1) : w;
+        AccessibilityNodeInfo hit = matchId(node, shortId);
+        if (hit != null) return hit;
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                AccessibilityNodeInfo found = findByShortId(child, wanted);
+                if (found != null) return found;
+                child.recycle();
+            }
+        }
+        return null;
+    }
+
+    private AccessibilityNodeInfo matchId(AccessibilityNodeInfo node, String shortId) {
+        CharSequence vid = node.getViewIdResourceName();
+        if (vid != null) {
+            String v = vid.toString().toLowerCase();
+            int slash = v.lastIndexOf('/');
+            String tail = slash >= 0 ? v.substring(slash + 1) : v;
+            if (tail.equals(shortId)) return node;
+        }
+        return null;
     }
 }

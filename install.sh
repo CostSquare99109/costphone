@@ -77,7 +77,8 @@ if [ -d "$HOME/.config/opencode" ]; then
 <!-- phone-control -->
 Phone tasks (control the user's Android apps): use `amctl` + skill `phone-control`.
 Loop: `amctl launch <pkg>` → `amctl snap` (refs @pN) → `amctl tapref @pN` / `type` / `click` → re-snap.
-Read screen as text: `amctl tree` (full) or `amctl snap -a`. Screenshot: `amctl see`.
+Fast: chain commands in ONE bash call and use `amctl waitfor "texto"` instead of `sleep`.
+Read screen as text: `amctl snap` (or `amctl tree` for the raw tree). Screenshot: `amctl see`.
 Guide: ~/.config/opencode/skills/android/phone-control/SKILL.md
 <!-- end phone-control -->
 EOF
@@ -106,7 +107,10 @@ fi
 
 echo ""
 echo "══════════════════════════════════════════════════"
-echo "  LISTO — prueba con:   amctl tree   (o: amctl see)"
-echo "  Si dice '⚠ SERVICIO NO RESPONDE', activa CostPhone"
-echo "  en Ajustes → Accesibilidad y reintenta."
+echo "  LISTO — prueba con:   amctl status"
+echo "  amctl snap            (debe imprimir la pantalla)"
+echo "  amctl see             (captura -> /sdcard/Download/accessdroid-shot.jpg)"
+echo "  Si 'status' dice que no hay canal rápido, reactiva"
+echo "  Ajustes → Accesibilidad → CostPhone (Android lo desactiva"
+echo "  solo al actualizar la app)."
 echo "══════════════════════════════════════════════════"

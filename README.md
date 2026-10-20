@@ -13,29 +13,59 @@ Sin root, sin cable USB, sin ADB inalámbrico.
 
 | Pieza | Qué es |
 |---|---|
-| **CostPhone (APK)** | App Android minimalista con un `AccessibilityService`. Recibe comandos y los convierte en toques, gestos, escritura, lectura de pantalla y capturas. (2 permisos + `WRITE_SECURE_SETTINGS` opcional, solo para la pantalla virtual.) |
+| **CostPhone (APK)** | App Android minimalista con un `AccessibilityService`. Recibe comandos y los convierte en toques, gestos, escritura, lectura de pantalla y capturas. (3 permisos + `WRITE_SECURE_SETTINGS` opcional, solo para la pantalla virtual.) |
 | **amctl** | CLI de Termux que controla todo: lanzar apps, snapshot con referencias `@pN`, taps, escribir, capturas PNG. |
 | **Skill `phone-control`** | Guía para OpenCode: enseña a cualquier agente a manejar el teléfono sin conocer los detalles internos. |
 
 ## Cómo funciona
 
 ```
-┌──────────────┐    am broadcast (termux-am)    ┌───────────────────────┐
-│    Termux    │ ─────────────────────────────► │  CostPhone APK        │
-│              │      + secreto compartido      │  AccessibilityService │
-│    amctl     │                                │                       │
-│              │                                │  tap / swipe / type   │
-│              │                                │  árbol UI / screenshot│
-│  lee resultados ◄──────────────────────────── │                       │
-│  (MediaStore) │   /sdcard/Download/*.txt|png   └───────────────────────┘
-└──────────────┘
+┌──────────────┐   socket TCP 127.0.0.1    ┌───────────────────────┐
+│    Termux    │ ─────────────────────────► │  CostPhone APK        │
+│              │   (canal rápido, v1.3+)     │  AccessibilityService │
+│    amctl     │                             │                       │
+│              │   am broadcast (fallback)   │  tap / swipe / type   │
+│              │ ─────────────────────────► │  árbol UI / snapshot  │
+│  lee ◄───────┘   resultado en /sdcard/Download/*.txt|png            │
+└──────────────┘                                             └────────┘
 ```
 
-1. `amctl` envía un broadcast explícito al paquete `com.accessdroid.termux`
-   (vía `termux-am`), con un secreto compartido.
-2. El `AccessibilityService` de CostPhone ejecuta la acción pedida.
-3. Los resultados (árbol de UI, PNG) se escriben en
-   `/sdcard/Download/accessdroid-*` y Termux los lee.
+1. `amctl` manda la orden por un **socket TCP de loopback** (canal rápido,
+   app v1.3+) y recibe la respuesta en el mismo viaje.
+2. El `AccessibilityService` de CostPhone ejecuta la acción y responde
+   *diciendo si funcionó* ("escrito: hola", "no se encontró el texto 'X'").
+3. Si el canal rápido no está (app vieja o servicio apagado), `amctl` cae al
+   canal clásico: broadcast + fichero en `/sdcard/Download/accessdroid-*`,
+   con sondeo. Funciona igual, pero cada orden cuesta 1-5 segundos.
+
+## Velocidad
+
+El canal rápido es la diferencia entre esto y esto:
+
+| | Antes (broadcast + fichero) | Ahora (socket local) |
+|---|---|---|
+| `amctl snap` | 3.5-9 s | **0.6-0.9 s** |
+| `amctl tap` / `type` / `click` | 1-5 s (y sin confirmar) | **0.4-1.3 s** (y con estado) |
+| `amctl see` | 2-5 s (PNG de 500 KB) | **0.9-1.3 s** (JPEG) |
+| `amctl waitfor` | depende del `sleep` | **0.8-2.4 s** (espera real) |
+| `amctl status` | ~4 s | **0.6-0.8 s** |
+
+Medido en el dispositivo de referencia (Android 16, MIUI/HyperOS).
+
+Además:
+
+- El snapshot **lo calcula el servicio** (no el CLI): sin descarga de árbol, sin
+  fichero intermedio y sin arrancar Python (~0.6 s) para parsearlo.
+- El trabajo pesado (volcar el árbol, escribir ficheros) sale del hilo
+  principal del servicio: la app deja deerse congarse y de hacer *ANR*.
+- `amctl waitfor "texto"` espera **dentro** del servicio: el agente no duerme
+  a ciegas ni gasta ida y vuelta.
+- `tapref` avisa si la ref quedó obsoleta, en vez de tocar donde no toca.
+- La captura es JPEG (10x más rápido de comprimir y de transferir que PNG).
+- `amctl enable` **re-activa el servicio solo** tras una actualización
+  (Android lo desactiva por seguridad): la app tiene `WRITE_SECURE_SETTINGS`
+  concedido y se auto-activa. Si algún día no lo tuviera, el comando abre
+  directamente la pantalla de Accesibilidad.
 
 ## Requisitos
 
@@ -63,12 +93,15 @@ El instalador hace **todo**:
 6. Abre el instalador del **APK**. En el teléfono:
    - Toca **Instalar** (si Play Protect avisa → *Entendido*).
    - **Ajustes → Accesibilidad → CostPhone → Activar** ✅
+   - (Ojo: Android desactiva el servicio en **cada** actualización. Con v1.3
+     basta con `amctl enable` en Termux: la app se reactiva sola.)
 
 Prueba final:
 
 ```sh
-amctl tree     # debería imprimir la pantalla actual como texto
-amctl see      # captura PNG -> /sdcard/Download/accessdroid-shot.png
+amctl status   # ¿el canal rápido está vivo?
+amctl snap     # debería imprimir la pantalla actual como texto
+amctl see      # captura JPEG -> /sdcard/Download/accessdroid-shot.jpg
 ```
 
 ## Uso
@@ -81,13 +114,15 @@ amctl see      # captura PNG -> /sdcard/Download/accessdroid-shot.png
 | Snapshot incluyendo no-interactivos | `amctl snap -a` |
 | Filtrar por texto | `amctl snap --filter "Enviar"` |
 | Navegar a una URL (sin omnibox) | `amctl openurl https://…` |
-| Captura PNG | `amctl see` |
+| Captura JPEG (PNG con `--png`) | `amctl see` |
 | Lanzar app | `amctl launch com.whatsapp` |
 | Escribir en el campo enfocado (reemplaza) | `amctl type "hola mundo"` |
 | Vaciar el campo enfocado | `amctl cleartext` |
 | Pegar clipboard en el campo | `amctl paste` |
+| Reactivar el servicio tras una actualización | `amctl enable` |
 | Enfocar un campo por texto | `amctl focus "Buscar…"` |
 | Tocar desde coords del screenshot | `amctl tapshot X Y [W H]` |
+| Localizar texto que NO sale en el árbol (OCR de la captura) | `amctl ocr "Actualizar" --region 700,1300,300,120` |
 | Tocar por coordenadas | `amctl tap 540 960` |
 | Long-press | `amctl longpress 540 960 700` |
 | Swipe | `amctl swipe 540 1800 540 600` |
@@ -103,12 +138,24 @@ Extra v1.1: cuando el teclado o una toolbar flotante están abiertos, sus
 botones entran al snapshot marcados `[ime]` / `[ovl]` / `[sys]` — Enter,
 borrar y "Seleccionar todo" se tocan con `tapref` como cualquier elemento.
 
+Extra v1.3: las órdenes viajan por un socket local y **vienen confirmadas**
+("escrito: hola", "no se encontró el texto 'X'"), el snapshot lo calcula el
+propio servicio (sin ficheros ni parseo en el móvil), `amctl waitfor` espera
+dentro de la app y `tapref` avisa cuando una ref ha quedado obsoleta en vez
+de tocar donde no toca.
+
 ### El loop (estilo agent-browser)
 
 ```
 amctl snap           →  lista interactiva con refs @pN
 amctl tapref @pN     →  toca ese elemento
 amctl snap           →  RE-SNAPSHOT (las refs se invalidan tras cada cambio)
+```
+
+Y la versión rápida, para no gastar una ida y vuelta del modelo por paso:
+
+```sh
+amctl launch com.whatsapp; amctl waitfor "Preguntar a Meta AI" 10000; amctl snap
 ```
 
 ## Pantalla virtual (v1.2) — el agente en su propio monitor
@@ -193,11 +240,15 @@ Los íconos se regeneran del logo con `python3 gen-icons.py`
 
 - Los broadcasts van dirigidos explícitamente al paquete
   (`-p com.accessdroid.termux`), no son difundidos a todas las apps.
+- El canal rápido (socket TCP) **solo escucha en 127.0.0.1** y exige el mismo
+  secreto compartido que el broadcast. Ninguna app de terceros en el móvil
+  debería poder usarlo sin conocer el secreto.
 - El servicio solo ejecuta comandos que traen el secreto compartido.
-- La app pide 2 permisos siempre (`BIND_ACCESSIBILITY_SERVICE`,
-  `QUERY_ALL_PACKAGES`) y uno opcional (`WRITE_SECURE_SETTINGS`, solo para crear
-  la pantalla virtual). Android no concede los que no sepidan; el opcional
-  arranca **sin** conceder y solo habilita `amctl display on/off`.
+- La app pide 3 permisos siempre (`BIND_ACCESSIBILITY_SERVICE`,
+  `QUERY_ALL_PACKAGES` e `INTERNET` — Android lo exige para abrir cualquier
+  socket, también de loopback) y uno opcional (`WRITE_SECURE_SETTINGS`, solo
+  para crear la pantalla virtual). Android no concede los que no sepidan; el
+  opcional arranca **sin** conceder y solo habilita `amctl display on/off`.
 - ⚠️ En esta v1 el secreto es fijo (visible en el APK que distribuyes).
   Protege contra comandos casuales de apps ajenas, no contra una app
   maliciosa que ya conozca el secreto. Si te preocupa, cambia `SECRET` en
@@ -212,4 +263,9 @@ Los íconos se regeneran del logo con `python3 gen-icons.py`
   estilo agent-browser, verificación anti-datos-viejos, skill para agentes,
   pantalla virtual dirigida (`amctl -d N`), y fixes varios (screenshot en
   Android 14/16, servicio tras updates).
+- **CostPhone v1.3** (canal rápido): socket TCP de loopback para las órdenes
+  (ida y vuelta único, con el estado de cada acción), snapshot calculado en el
+  servicio (fuera el parseo en el móvil), `waitfor` server-side, `tapref` que
+  detecta refs obsoletas, capturas en JPEG, trabajo pesado fuera del hilo
+  principal (se acabaron los ANR), y sondeo de 50ms en el CLI.
 - Licencia: **MIT** — ver [LICENSE](LICENSE).

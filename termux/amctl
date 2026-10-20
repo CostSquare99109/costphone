@@ -1,51 +1,53 @@
 #!/data/data/com.termux/files/usr/bin/bash
 #==============================================================================
 # amctl - App control toolkit for Termux
-# Drives the AccessDroid AccessibilityService (simulates clicks, scrolls,
-# type-into-field, UI-tree inspection) + am transport for app lifecycle.
+# Drives the CostPhone AccessibilityService (simulates clicks, scrolls,
+# type-into-field, UI-tree inspection) + app lifecycle.
 #
 # Prerequisites:
-#   1. AccessDroid APK built & installed (see bin/accessdroid/build.sh)
-#   2. Settings -> Accessibility -> AccessDroid  =>  ON
+#   1. CostPhone APK built & installed (see app/build.sh)
+#   2. Settings -> Accessibility -> CostPhone  =>  ON
 #
-# Transport (auto-detected):
-#   "socket": termux-am AM socket (Termux app v0.119+). Full functionality.
-#   "am":     classic TermuxAm 'am' command (works on stable Termux v0.118.x).
-#             Everything works except pm-based commands, which need the socket:
-#             list / find / stop / info / perms / grant / revoke / clear.
+# Transport (auto):
+#   "socket": TCP local 127.0.0.1:39871-39875. Es el canal normal: la orden y
+#             su respuesta viajan en un solo ida y vuelta, sin ficheros ni
+#             esperas. Requiere app v1.3+.
+#   "am":     broadcast clásico de Termux + fichero en /sdcard/Download.
+#             Solo si el canal rápido no está (app vieja o servicio parado).
+#             Cada orden cuesta de 1 a 5 segundos (broadcast + escritura +
+#             sondeo), así que se avisa.
 #
 # Usage: amctl <command> [args...]
-#   list     [query]            List 3rd-party apps (socket only)
-#   find     <name>             Search apps by label (socket only)
-#   launch   <app|pkg>          Launch an app (use package name without socket)
-#   stop     <app|pkg>          Force-stop an app (socket only)
-#   info     <app|pkg>          Package info (socket only)
-#   perms    <app|pkg>          List app permissions (socket only)
-#   grant    <app|pkg> <perm>   Grant a permission (socket only)
-#   revoke   <app|pkg> <perm>   Revoke a permission (socket only)
-#   clear    <app|pkg>          Clear app data/cache (socket only)
-#   tree                         Dump current UI tree -> /sdcard/Download/accessdroid-tree.txt
-#   snap     [-a] [--filter T]  Snapshot con refs @pN (estilo agent-browser snapshot -i)
-#   tapref   @pN [ms]           Tap on the element of that snap ref (re-snap tras cambios)
-#   see      [file]             Screenshot PNG -> /sdcard/Download/accessdroid-shot.png
+#   list     [query]            List 3rd-party apps
+#   find     <name>             Search apps by package name (shows the real label)
+#   launch   <app|pkg>          Launch an app
+#   stop     <app|pkg>          Force-stop an app
+#   info     <app|pkg>          Package info
+#   perms    <app|pkg>          List app permissions
+#   grant    <app|pkg> <perm>   Grant a permission
+#   revoke   <app|pkg> <perm>   Revoke a permission
+#   clear    <app|pkg>          Clear app data/cache
+#   tree                         Dump current UI tree (raw)
+#   snap     [-a] [--filter T]  Snapshot con refs @pN (estilo agent-browser)
+#   tapref   @pN [--settle ms]  Tap on the element of that snap ref
+#   waitfor  "text" [ms]        Espera a que aparezca un texto (1 solo viaje)
+#   see      [file] [--scale S] Captura JPEG de la pantalla
+#   ocr      "texto" [conf] [--region x,y,w,h]  OCR de la captura: coordenadas de un texto
 #   tap      X Y [ms]           Tap at (X,Y); optional hold duration
 #   longpress X Y [ms]          Long-press at (X,Y); default 500ms
 #   swipe    X1 Y1 X2 Y2 [ms]   Swipe/drag
 #   scroll   up|down [x y]      Scroll at position
-#   back                         Press back
-#   home                         Press home
-#   recents                      Open recents
-#   type     <text>             Type text into the focused field (REPLACES its content)
+#   back / home / recents       Botones del sistema
+#   type     <text>             Type text into the focused field (REPLACES it)
 #   cleartext                   Clear the focused text field
 #   paste                       Paste clipboard into the focused field
 #   focus     [text|id]         Focus a field by text or resource-id
-#   openurl  <url> [pkg]       Open URL in browser (default browser or given package)
+#   openurl  <url> [pkg]       Open URL in browser (default browser or given pkg)
 #   click    "text"             Click UI element by visible text
-#   clickid  resourceId          Click UI element by resource id
+#   clickid  resourceId         Click UI element by resource id
 #   scrollto "text"             Scroll to an element with text
 #   tapshot  X Y [W H]          Tap coords seen in the screenshot PNG (W H = size you saw)
 #   float    <texto> [pkg]      Pon la app en ventana flotante (recents->long-press->MIUI)
-#   screenshot [file]          Screenshot PNG -> /sdcard/Download/accessdroid-shot.png
 #   presskey <key>               Press a key (back/home/recents only)
 #
 # Pantalla virtual (display secundario para el agente):
@@ -54,24 +56,170 @@
 #                              flags: gravity_top_left|top_right|bottom_left|bottom_right
 #   display off                La apaga
 #   -d N / --display N         Dirige ESTA orden al display N (ej: amctl -d 2 snap).
-#                              Afecta a tap/swipe/type/click/snap/tree/see/launch/back.
 #                              Sin -d, todo va a la pantalla 0 (la del usuario).
 #==============================================================================
 
 set -u
 PROG="amctl"
 SECRET="termux-accessdroid-2025"
+SECRET_B64="dGVybXV4LWFjY2Vzc2Ryb2lkLTIwMjU="
 PKG="com.accessdroid.termux"
 DISPLAY_ID=0
 POSITIONAL=()
+CACHE="$HOME/.cache/amctl"
+mkdir -p "$CACHE" 2>/dev/null || true
 
-# ---- transport auto-detection: AM socket if available, else classic 'am' ----
+# ---- acciones del servicio (canal rápido y broadcast comparten nombre) ----
+ACTION_TAP="com.accessdroid.termux.ACTION_TAP"
+ACTION_SWIPE="com.accessdroid.termux.ACTION_SWIPE"
+ACTION_LONG_PRESS="com.accessdroid.termux.ACTION_LONG_PRESS"
+ACTION_SCROLL_UP="com.accessdroid.termux.ACTION_SCROLL_UP"
+ACTION_SCROLL_DOWN="com.accessdroid.termux.ACTION_SCROLL_DOWN"
+ACTION_BACK="com.accessdroid.termux.ACTION_BACK"
+ACTION_HOME="com.accessdroid.termux.ACTION_HOME"
+ACTION_RECENTS="com.accessdroid.termux.ACTION_RECENTS"
+ACTION_TYPE="com.accessdroid.termux.ACTION_TYPE"
+ACTION_CLICK_TEXT="com.accessdroid.termux.ACTION_CLICK_TEXT"
+ACTION_CLICK_ID="com.accessdroid.termux.ACTION_CLICK_ID"
+ACTION_SCROLL_TO="com.accessdroid.termux.ACTION_SCROLL_TO"
+ACTION_PRESS_KEY="com.accessdroid.termux.ACTION_PRESS_KEY"
+ACTION_SCREENDUMP="com.accessdroid.termux.ACTION_SCREENDUMP"
+ACTION_GET_UI_TREE="com.accessdroid.termux.ACTION_GET_UI_TREE"
+ACTION_CLEAR_TEXT="com.accessdroid.termux.ACTION_CLEAR_TEXT"
+ACTION_PASTE="com.accessdroid.termux.ACTION_PASTE"
+ACTION_FOCUS="com.accessdroid.termux.ACTION_FOCUS"
+ACTION_OPEN_URI="com.accessdroid.termux.ACTION_OPEN_URI"
+ACTION_START_ACTIVITY="com.accessdroid.termux.ACTION_START_ACTIVITY"
+ACTION_DISPLAY="com.accessdroid.termux.ACTION_DISPLAY"
+ACTION_GET_SNAPSHOT="com.accessdroid.termux.ACTION_GET_SNAPSHOT"
+ACTION_TAPREF="com.accessdroid.termux.ACTION_TAPREF"
+ACTION_WAITFOR="com.accessdroid.termux.ACTION_WAITFOR"
+ACTION_PING="com.accessdroid.termux.ACTION_PING"
+ACTION_ENABLE_SERVICE="com.accessdroid.termux.ACTION_ENABLE_SERVICE"
+
+# ---- flags globales: -d N / --display N  (resto en POSITIONAL) ----
+parse_display() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--display)
+                if [[ -n "${2:-}" ]]; then DISPLAY_ID="$2"; shift 2; continue; fi ;;
+            -d?*) DISPLAY_ID="${1#-d}"; shift; continue ;;
+        esac
+        POSITIONAL+=("$1"); shift
+    done
+}
+
+# ==========================================================================
+#  Canal rápido: TCP de loopback contra el servicio de accesibilidad
+# ==========================================================================
+CP_PORTS=(39871 39872 39873 39874 39875)
+# La app se ata al IPv4 de loopback, pero en Android 16 getLoopbackAddress()
+# devuelve ::1 — probamos los dos por si acaso.
+CP_HOSTS=(127.0.0.1 ::1)
+CP_CODE=""      # ok | fail | empty
+CP_TEXT=""      # cuerpo de texto
+CP_B64=""       # cuerpo binario en base64
+CP_ARGS=""      # payload de argumentos (se codifica en un bloque)
+
+# Añade un argumento al payload: tipo (i/l/f/s) + clave + valor.
+cp_arg() {
+    local v="$3"
+    v=${v//\\/\\\\}
+    v=${v//$'\n'/\\n}
+    CP_ARGS="${CP_ARGS}$1:$2=$v"$'\n'
+}
+
+# Codifica el payload de argumentos (un solo base64 por orden).
+cp_encode_args() {
+    if [[ -z "$CP_ARGS" ]]; then printf ''; return; fi
+    printf '%s' "$CP_ARGS" | base64 | tr -d '\n'
+}
+
+# Devuelve "host puerto" donde el servicio esté escuchando (o falla).
+cp_port() {
+    local f="$CACHE/port" p host
+    if [[ -f "$f" ]]; then
+        read -r host p < "$f" 2>/dev/null || true
+        if [[ -n "${host:-}" && -n "${p:-}" ]] && { exec 7<>"/dev/tcp/$host/$p"; } 2>/dev/null; then
+            exec 7<&- 7>&-
+            printf '%s %s\n' "$host" "$p"; return 0
+        fi
+    fi
+    for p in "${CP_PORTS[@]}"; do
+        for host in "${CP_HOSTS[@]}"; do
+            if { exec 7<>"/dev/tcp/$host/$p"; } 2>/dev/null; then
+                exec 7<&- 7>&-
+                printf '%s %s\n' "$host" "$p" > "$f" 2>/dev/null || true
+                printf '%s %s\n' "$host" "$p"; return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# Manda una orden por el canal rápido. Devuelve 0 si hubo respuesta.
+cp_call() {
+    local action="$1" args="${2:-}"
+    local host port head code len enc body
+    CP_CODE=""; CP_TEXT=""; CP_B64=""
+    read -r host port < <(cp_port) || true
+    [[ -n "${host:-}" && -n "${port:-}" ]] || return 1
+    { exec 7<>"/dev/tcp/$host/$port"; } 2>/dev/null || return 1
+    if ! printf 'CP/1 %s b:secret=%s b:args=%s\n' "$action" "$SECRET_B64" "$args" >&7 2>/dev/null; then
+        exec 7<&- 7>&-; return 1
+    fi
+    if IFS= read -r -t 25 head <&7; then
+        read -r _ code len enc <<<"$head"
+        body=""
+        if [[ "${len:-0}" =~ ^[0-9]+$ && "${len:-0}" -gt 0 ]]; then
+            IFS= read -r -N "$len" body <&7 2>/dev/null || true
+        fi
+        exec 7<&- 7>&-
+        CP_CODE="${code:-fail}"
+        if [[ "${enc:-raw}" == "b64" ]]; then CP_B64="$body"; else CP_TEXT="$body"; fi
+        return 0
+    fi
+    exec 7<&- 7>&-
+    return 1
+}
+
+# ¿Respondió el canal rápido? (1 intento, para no gastar 5 conexiones)
+cp_alive() {
+    CP_ARGS=""
+    cp_call $ACTION_PING "" || return 1
+    [[ "$CP_CODE" == "ok" ]]
+}
+
+# Imprime el cuerpo de la última respuesta y devuelve su código.
+cp_report() {
+    local body="${CP_TEXT:-$CP_B64}"
+    case "$CP_CODE" in
+        ok)     [[ -n "$body" ]] && printf '%s\n' "$body"; return 0 ;;
+        empty)  [[ -n "$body" ]] && printf '%s\n' "$body" >&2; return 1 ;;
+        *)      [[ -n "$body" ]] && printf '%s\n' "$body" >&2; return 1 ;;
+    esac
+}
+
+# ==========================================================================
+#  Canal legacy: broadcast + fichero (app vieja o servicio parado)
+# ==========================================================================
 TRANSPORT="am"
-if command -v termux-am >/dev/null 2>&1 && termux-am get-current-user >/dev/null 2>&1; then
-    TRANSPORT="socket"
-fi
+detect_transport() {
+    local f="$CACHE/transport" now ts val
+    now=$(date +%s)
+    if [[ -f "$f" ]]; then
+        read -r ts val < "$f" 2>/dev/null || true
+        if [[ -n "${ts:-}" && -n "${val:-}" && $((now - ts)) -lt 300 ]]; then
+            TRANSPORT="$val"; return
+        fi
+    fi
+    TRANSPORT="am"
+    if command -v termux-am >/dev/null 2>&1 && termux-am get-current-user >/dev/null 2>&1; then
+        TRANSPORT="socket"
+    fi
+    printf '%s %s\n' "$now" "$TRANSPORT" > "$f" 2>/dev/null || true
+}
 
-# Run an AM command through the active transport.
 tam() {
     if [[ "$TRANSPORT" == "socket" ]]; then
         termux-am "$@"
@@ -80,19 +228,8 @@ tam() {
     fi
 }
 
-# Lifecycle commands (pm/force-stop) need the socket transport.
-need_socket() {
-    if [[ "$TRANSPORT" != "socket" ]]; then
-        echo "amctl $1: requiere el AM socket (app Termux v0.119+)." >&2
-        echo "En Termux estable funcionan: tap swipe longpress scroll type cleartext paste focus openurl tapshot" >&2
-        echo "clickid click scrollto back home recents presskey screenshot y launch <package.name>" >&2
-        return 4
-    fi
-}
-
-# ---- envía un broadcast a AccessDroid (siempre lleva el secreto y el display) ----
+# ---- envía un broadcast a CostPhone (siempre lleva el secreto y el display) ----
 bc() {
-    # $1 = action, resto = extras --es/--ei/--el
     local action="$1"; shift
     if [[ "$DISPLAY_ID" != "0" ]]; then
         tam broadcast -p "$PKG" -a "$action" --es secret "$SECRET" --ei display "$DISPLAY_ID" "$@" >/dev/null 2>&1
@@ -101,21 +238,129 @@ bc() {
     fi
 }
 
-# ---- send a command to the AccessibilityService and report errors ----
-ac() {
-    local action="$1"; shift
-    if ! bc "$action" "$@"; then
-        echo "ERROR: failed to send command '$action'." >&2
-        echo "Is AccessDroid's accessibility service enabled?" >&2
-        echo "Settings -> Accessibility -> AccessDroid -> ON" >&2
-        return 3
+# ---- espera a que aparezca un fichero (sondeo de 50ms, no de 1s) ----
+wait_file() {
+    local f="$1" timeout="${2:-8}" i=0 max=$(( ${timeout:-8} * 20 ))
+    while (( i < max )); do
+        [[ -f "$f" ]] && return 0
+        sleep 0.05
+        i=$((i+1))
+    done
+    return 1
+}
+
+# ---- avisa (una vez) de que el canal rápido no está ----
+warn_legacy() {
+    [[ -f "$CACHE/warned-legacy" ]] && return 0
+    touch "$CACHE/warned-legacy" 2>/dev/null || true
+    echo "aviso: canal rápido no disponible (app v1.3+ o servicio apagado)." >&2
+    echo "       las órdenes van por broadcast: ~1-5s cada una." >&2
+}
+
+map_file() {
+    if [[ "$DISPLAY_ID" == "0" ]]; then echo "$CACHE/snapshot-map.tsv"
+    else echo "$CACHE/snapshot-map-d$DISPLAY_ID.tsv"; fi
+}
+
+shot_file() {
+    if [[ "$DISPLAY_ID" == "0" ]]; then echo "/sdcard/Download/accessdroid-shot.jpg"
+    else echo "/sdcard/Download/accessdroid-shot-d$DISPLAY_ID.jpg"; fi
+}
+
+tree_file() {
+    if [[ "$DISPLAY_ID" == "0" ]]; then echo "/sdcard/Download/accessdroid-tree.txt"
+    else echo "/sdcard/Download/accessdroid-tree-d$DISPLAY_ID.txt"; fi
+}
+
+# Ejecuta una orden simple: canal rápido si está; si no, broadcast.
+#   $1 = acción del canal rápido, $2 = acción broadcast,
+#   $3.. = argumentos "tipo:clave=valor" (i/l/f/s).
+# El valor puede contener espacios y signos "=" (URLs, textos).
+P_TYPES=(); P_KEYS=(); P_VALS=()
+parse_kv() {
+    P_TYPES=(); P_KEYS=(); P_VALS=()
+    local kv rest
+    for kv in "$@"; do
+        rest="${kv#*:}"
+        P_TYPES+=("${kv%%:*}")
+        P_KEYS+=("${rest%%=*}")
+        P_VALS+=("${rest#*=}")
+    done
+}
+
+cp_or_bc() {
+    local cpaction="$1" bcaction="$2"; shift 2
+    CP_ARGS=""
+    parse_kv "$@"
+    local i
+    for (( i=0; i<${#P_TYPES[@]}; i++ )); do
+        cp_arg "${P_TYPES[$i]}" "${P_KEYS[$i]}" "${P_VALS[$i]}"
+    done
+    if cp_call "$cpaction" "$(cp_encode_args)"; then
+        cp_report
+        return $?
     fi
+    warn_legacy
+    detect_transport
+    [[ -z "$bcaction" ]] && return 1
+    local extras=()
+    for (( i=0; i<${#P_TYPES[@]}; i++ )); do
+        case "${P_TYPES[$i]}" in
+            i) extras+=(--ei "${P_KEYS[$i]}" "${P_VALS[$i]}") ;;
+            l) extras+=(--el "${P_KEYS[$i]}" "${P_VALS[$i]}") ;;
+            f) extras+=(--ef "${P_KEYS[$i]}" "${P_VALS[$i]}") ;;
+            s) extras+=(--es "${P_KEYS[$i]}" "${P_VALS[$i]}") ;;
+        esac
+    done
+    bc "$bcaction" "${extras[@]}"
+    return 0
+}
+
+# ========================= subcommands =========================
+
+# Lista paquetes: "path\tpaquete". El binario pm de Android (no el shim tam,
+# que necesita la app Termux:API corriendo).
+pm_pkgs() {
+    local extra="-3"; [[ "${1:-}" == "all" ]] && extra=""
+    ( command pm list packages $extra -f 2>/dev/null || tam pm list packages $extra -f 2>/dev/null ) \
+    | sed 's/^package://' \
+    | awk -F= '{pkg=$NF; path=substr($0,1,length($0)-length(pkg)-1); print path"\t"pkg}'
+}
+
+cmd_list() {
+    detect_transport
+    local q="${1:-}" scope="${2:-}"
+    pm_pkgs "$scope" \
+    | if [[ -n "$q" ]]; then grep -i -- "$q"; else cat; fi \
+    | awk -F'\t' '{printf "%-62s %s\n",$1,$2}'
+}
+
+cmd_find() {
+    # Busca una app por nombre de PAQUETE (rápido) y muestra su etiqueta real.
+    # La etiqueta se saca con aapt2 solo de los que coinciden: volcar 300 APKs
+    # del sistema sería lentísimo.
+    detect_transport
+    local q="${1:-}"
+    [[ -z "$q" ]] && { echo "usage: amctl find <paquete>" >&2; return 2; }
+    local n=0
+    while IFS=$'\t' read -r apk pkg; do
+        echo "$pkg" | grep -iq -- "$q" || continue
+        local label=""
+        command -v aapt2 >/dev/null 2>&1 && \
+            label=$(aapt2 dump badging "$apk" 2>/dev/null | sed -n "s/^application-label:'\(.*\)'.*/\1/p" | head -1)
+        [[ -z "$label" ]] && label="(sin etiqueta)"
+        printf "%-32s %s\n" "$label" "$pkg"
+        n=$((n+1))
+    done < <(pm_pkgs all)
+    [[ $n -eq 0 ]] && echo "sin coincidencias para '$q'" >&2
+    return 0
 }
 
 # ---- package resolution (substring match -> unique package) ----
 resolve_pkg() {
     local input="$1"
     [[ -z "$input" ]] && { echo "missing app/package argument" >&2; return 2; }
+    detect_transport
     if [[ "$TRANSPORT" != "socket" ]]; then
         if [[ "$input" == *.* ]]; then
             echo "$input"; return 0
@@ -140,66 +385,29 @@ resolve_pkg() {
     echo "$matches"; return 0
 }
 
-# ---- flags globales: -d N / --display N  (resto en POSITIONAL) ----
-parse_display() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -d|--display)
-                if [[ -n "${2:-}" ]]; then DISPLAY_ID="$2"; shift 2; continue; fi ;;
-            -d?*) DISPLAY_ID="${1#-d}"; shift; continue ;;
-        esac
-        POSITIONAL+=("$1"); shift
-    done
-}
-
-map_file() {
-    if [[ "$DISPLAY_ID" == "0" ]]; then echo "$HOME/.cache/amctl/snapshot-map.tsv"
-    else echo "$HOME/.cache/amctl/snapshot-map-d$DISPLAY_ID.tsv"; fi
-}
-
-shot_file() {
-    if [[ "$DISPLAY_ID" == "0" ]]; then echo "/sdcard/Download/accessdroid-shot.png"
-    else echo "/sdcard/Download/accessdroid-shot-d$DISPLAY_ID.png"; fi
-}
-
-# ========================= subcommands =========================
-
-cmd_list() {
-    need_socket list || return $?
-    local q="${1:-}"
-    tam pm list packages -3 -f 2>/dev/null \
-        | sed 's/^package://' \
-        | if [[ -n "$q" ]]; then grep -i "$q"; else cat; fi \
-        | awk -F'=' '{printf "%-45s %s\n",$1,$2}'
-}
-
-cmd_find() {
-    need_socket find || return $?
-    local q="${1:-}"
-    [[ -z "$q" ]] && { echo "usage: amctl find <name>" >&2; return 2; }
-    command -v aapt2 >/dev/null && {
-        tam pm list packages -3 -f 2>/dev/null | sed 's/^package://' | while IFS='=' read -r pkg apk; do
-            local label
-            label=$(aapt2 dump badging "$apk" 2>/dev/null | sed -n "s/.*application-label:'(.*)'.app=//p" | head -1)
-            [[ -z "$label" ]] && label="(no label)"
-            if echo "$label $pkg" | grep -iq "$q"; then
-                printf "%-30s %s\n" "$label" "$pkg"
-            fi
-        done
-    } || cmd_list "$q"
-    return 0
-}
-
 cmd_launch() {
+    local arg="${1:-}"
+    [[ -z "$arg" ]] && { echo "uso: amctl launch <package.name>" >&2; return 2; }
+    local pkg
+    if [[ "$arg" == *.* ]]; then pkg="$arg"; else pkg=$(resolve_pkg "$arg") || return $?; fi
+
+    # canal rápido: la app sabe lanzar en un display concreto
+    CP_ARGS=""
+    cp_arg s package "$pkg"
+    cp_arg i display "$DISPLAY_ID"
+    if cp_call $ACTION_START_ACTIVITY "$(cp_encode_args)"; then
+        cp_report
+        return $?
+    fi
+
+    warn_legacy
+    detect_transport
     if [[ "$DISPLAY_ID" != "0" ]]; then
-        # lanzar en la pantalla virtual lo hace la propia app (ActivityOptions.setLaunchDisplayId)
-        local pkg; pkg=$(resolve_pkg "$1") || return $?
-        bc com.accessdroid.termux.ACTION_START_ACTIVITY --es package "$pkg"
+        bc $ACTION_START_ACTIVITY --es package "$pkg"
         echo "Launched $pkg on display $DISPLAY_ID"
         return 0
     fi
     if [[ "$TRANSPORT" == "socket" ]]; then
-        local pkg; pkg=$(resolve_pkg "$1") || return $?
         local comp
         comp=$(tam cmd package resolve-activity --brief \
             -c android.intent.category.LAUNCHER \
@@ -213,137 +421,403 @@ cmd_launch() {
                 && echo "Launched $pkg (monkey)" || { echo "launch failed for $pkg"; return 1; }
         fi
     else
-        local pkg="${1:-}"
-        if [[ "$pkg" != *.* ]]; then
-            echo "uso: amctl launch <package.name>   (sin socket no hay busqueda por nombre)" >&2
-            return 2
-        fi
         if tam start --user 0 -a android.intent.action.MAIN \
             -c android.intent.category.LAUNCHER -p "$pkg" >/dev/null 2>&1; then
             echo "Launched $pkg"
-        elif bc com.accessdroid.termux.ACTION_START_ACTIVITY --es package "$pkg"; then
-            echo "Launched $pkg (via AccessDroid)"
+        elif bc $ACTION_START_ACTIVITY --es package "$pkg"; then
+            echo "Launched $pkg (via CostPhone)"
         else
             echo "launch failed for $pkg" >&2
-            echo "(sin socket hay limite de visibilidad de paquetes: prueba el componente explicito: am start -n $pkg/.ActividadPrincipal)" >&2
             return 1
         fi
     fi
 }
 
-cmd_stop()   { need_socket stop || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam force-stop "$pkg" 2>/dev/null && echo "Stopped $pkg" || { echo "stop failed"; return 1; }; }
-cmd_info()   { need_socket info || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam pm dump "$pkg" 2>/dev/null | grep -E 'versionCode|targetSdk|path|uid|minSdk' | head -8; }
-cmd_perms()  { need_socket perms || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam pm list permissions -g -p "$pkg" 2>/dev/null; }
-cmd_grant()  { need_socket grant || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; shift; local perm="$1"; tam pm grant "$pkg" "$perm" 2>/dev/null && echo "Granted $perm to $pkg"; }
-cmd_revoke() { need_socket revoke || return $?; local p; p=$(resolve_pkg "$1") || return $?; shift; local perm; tam pm revoke "${p}" "${1:-}" 2>/dev/null; }
-cmd_clear()  { need_socket clear || return $?; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam clear package "$pkg" 2>/dev/null && echo "Cleared $pkg"; }
-cmd_tree()   { local f=/sdcard/Download/accessdroid-tree.txt; rm -f "$f"; bc com.accessdroid.termux.ACTION_GET_UI_TREE; local ok=0; for i in 1 2 3 4 5; do sleep 1; [[ -f "$f" ]] && { ok=1; break; }; done; if [[ $ok == 1 ]]; then cat "$f"; else echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)"; return 1; fi; }
-cmd_snap()   { local f=/sdcard/Download/accessdroid-tree.txt; rm -f "$f"; bc com.accessdroid.termux.ACTION_GET_UI_TREE; local ok=0; for i in 1 2 3 4 5; do sleep 1; [[ -f "$f" ]] && { ok=1; break; }; done; [[ $ok == 1 ]] || { echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2; return 1; }; python3 "$HOME/bin/amctl-snap.py" --display "$DISPLAY_ID" "$@"; }
+cmd_stop()   { detect_transport; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam force-stop "$pkg" 2>/dev/null && echo "Stopped $pkg" || { echo "stop failed"; return 1; }; }
+cmd_info()   { detect_transport; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam pm dump "$pkg" 2>/dev/null | grep -E 'versionCode|targetSdk|path|uid|minSdk' | head -8; }
+cmd_perms()  { detect_transport; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam pm list permissions -g -p "$pkg" 2>/dev/null; }
+cmd_grant()  { detect_transport; local pkg; pkg=$(resolve_pkg "$1") || return $?; shift; local perm="$1"; tam pm grant "$pkg" "$perm" 2>/dev/null && echo "Granted $perm to $pkg"; }
+cmd_revoke() { detect_transport; local p; p=$(resolve_pkg "$1") || return $?; shift; local perm; perm="${1:-}"; tam pm revoke "${p}" "$perm" 2>/dev/null; }
+cmd_clear()  { detect_transport; local pkg; pkg=$(resolve_pkg "$1") || return $?; tam clear package "$pkg" 2>/dev/null && echo "Cleared $pkg"; }
 
+# ---- árbol crudo ----
+cmd_tree() {
+    CP_ARGS=""
+    cp_arg i display "$DISPLAY_ID"
+    if cp_call $ACTION_GET_UI_TREE "$(cp_encode_args)"; then
+        [[ -n "$CP_TEXT" ]] && printf '%s' "$CP_TEXT"
+        [[ "$CP_CODE" == "ok" ]] && return 0
+        return 1
+    fi
+    warn_legacy
+    local f; f=$(tree_file)
+    rm -f "$f" 2>/dev/null || true
+    bc $ACTION_GET_UI_TREE
+    if wait_file "$f" 8; then cat "$f"; else
+        echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2
+        return 1
+    fi
+}
+
+# ---- snapshot con refs @pN ----
+cmd_snap() {
+    local mode=0 filter=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--all) mode=1; shift ;;
+            --filter) filter="${2:-}"; shift 2 ;;
+            --filter=*) filter="${1#*=}"; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    # canal rápido: el snapshot lo calcula el servicio (sin Python, sin ficheros)
+    CP_ARGS=""
+    cp_arg i display "$DISPLAY_ID"
+    cp_arg i mode "$mode"
+    [[ -n "$filter" ]] && cp_arg s filter "$filter"
+    if cp_call $ACTION_GET_SNAPSHOT "$(cp_encode_args)"; then
+        cp_report
+        return $?
+    fi
+
+    # legacy: árbol + parser local
+    warn_legacy
+    local f; f=$(tree_file)
+    rm -f "$f" 2>/dev/null || true
+    bc $ACTION_GET_UI_TREE
+    if ! wait_file "$f" 8; then
+        echo "(⚠ SERVICIO NO RESPONDE — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2
+        return 1
+    fi
+    local parser="$HOME/bin/amctl-snap.py" pyargs=()
+    [[ -f "$parser" ]] || parser="$CACHE/amctl-snap.py"
+    [[ -f "$parser" ]] || { echo "(no encuentro amctl-snap.py — reinstala con install.sh)" >&2; return 1; }
+    [[ "$mode" == "1" ]] && pyargs+=("-a")
+    [[ -n "$filter" ]] && pyargs+=("--filter" "$filter")
+    python3 "$parser" --display "$DISPLAY_ID" "${pyargs[@]}"
+}
+
+# ---- tocar una ref ----
 cmd_tapref() {
-    local ref="${1:-}"
-    [[ -z "$ref" ]] && { echo "uso: amctl tapref @pN  (refs de 'amctl snap')" >&2; return 2; }
+    local ref="${1:-}" settle=""
+    [[ -z "$ref" ]] && { echo "uso: amctl tapref @pN [--settle ms]" >&2; return 2; }
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --settle) settle="${2:-300}"; shift 2 ;;
+            --settle=*) settle="${1#*=}"; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    # canal rápido: el servicio resuelve la ref (y avisa si quedó obsoleta)
+    CP_ARGS=""
+    cp_arg s ref "$ref"
+    cp_arg i display "$DISPLAY_ID"
+    if cp_call $ACTION_TAPREF "$(cp_encode_args)"; then
+        local rc=0
+        cp_report || rc=1
+        [[ -n "$settle" ]] && sleep "$(awk "BEGIN{print $settle/1000}")"
+        return $rc
+    fi
+
+    # legacy: la tabla de refs la escribió el parser local
+    warn_legacy
     ref="${ref#@}"; [[ "$ref" != p* ]] && ref="p$ref"
     local MAP; MAP=$(map_file)
     [[ -f "$MAP" ]] || { echo "no hay snapshot — ejecuta: amctl snap" >&2; return 1; }
     local line; line=$(awk -F'\t' -v r="$ref" '$1==r{print; exit}' "$MAP")
     [[ -z "$line" ]] && { echo "ref @$ref no existe — re-ejecuta: amctl snap" >&2; return 1; }
     local cx cy; cx=$(printf '%s' "$line" | cut -f2); cy=$(printf '%s' "$line" | cut -f3)
-    ac com.accessdroid.termux.ACTION_TAP --ei x "$cx" --ei y "$cy" --el duration "${2:-80}"
+    bc $ACTION_TAP --ei x "$cx" --ei y "$cy" --el duration 80
     echo "tap @$ref -> ($cx,$cy)"
+    [[ -n "$settle" ]] && sleep "$(awk "BEGIN{print $settle/1000}")"
+    return 0
 }
 
-# input / UI subcommands (via AccessDroid)
+# ---- esperar a que aparezca un texto ----
+cmd_waitfor() {
+    local text="${1:-}" timeout="${2:-8000}"
+    [[ -z "$text" ]] && { echo "uso: amctl waitfor \"texto\" [ms]" >&2; return 2; }
+    CP_ARGS=""
+    cp_arg s text "$text"
+    cp_arg l timeout "$timeout"
+    cp_arg i display "$DISPLAY_ID"
+    cp_arg i mode 0
+    if cp_call $ACTION_WAITFOR "$(cp_encode_args)"; then
+        cp_report
+        return $?
+    fi
+    # legacy: sondea el snapshot local hasta que aparezca
+    warn_legacy
+    local deadline=$(( $(date +%s%3N) + timeout )) out
+    while (( $(date +%s%3N) < deadline )); do
+        out=$(cmd_snap --filter "$text" 2>/dev/null)
+        if [[ -n "$out" ]] && ! grep -q "sin elementos interactivos" <<<"$out"; then
+            printf '%s\n' "$out"
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo "timeout: '$text' no apareció en ${timeout}ms" >&2
+    return 1
+}
 
-cmd_tap()        { ac com.accessdroid.termux.ACTION_TAP --ei x "${1:-0}" --ei y "${2:-0}" --el duration "${3:-80}"; }
-cmd_longpress()  { ac com.accessdroid.termux.ACTION_LONG_PRESS --ei x "${1:-0}" --ei y "${2:-0}" --el duration "${3:-500}"; }
-cmd_swipe()      { ac com.accessdroid.termux.ACTION_SWIPE --ei x1 "${1:-0}" --ei y1 "${2:-0}" --ei x2 "${3:-0}" --ei y2 "${4:-0}" --el duration "${5:-300}"; }
-cmd_scroll()     { local dir="${1:-down}"; [[ "$dir" == down ]] && ac com.accessdroid.termux.ACTION_SCROLL_DOWN --ei x "${2:-0}" --ei y "${3:-0}" \
-                    || ac com.accessdroid.termux.ACTION_SCROLL_UP --ei x "${2:-0}" --ei y "${3:-0}"; }
-cmd_back()       { if [[ "$DISPLAY_ID" != "0" ]]; then
-                        # back dirigido: busca el botón de retroceso de la app en ese display.
-                        # Si no lo encuentra, la app escribe el motivo aquí.
-                        local errf=/sdcard/Download/accessdroid-error.txt
-                        rm -f "$errf"; bc com.accessdroid.termux.ACTION_DISPLAY_BACK; sleep 2
-                        [[ -f "$errf" ]] && { echo "back (display $DISPLAY_ID): $(cat "$errf")"; return 1; }
-                    else bc com.accessdroid.termux.ACTION_BACK; fi; }
-cmd_home()       { bc com.accessdroid.termux.ACTION_HOME; }
-cmd_recents()    { bc com.accessdroid.termux.ACTION_RECENTS; }
-cmd_type()       { bc com.accessdroid.termux.ACTION_TYPE --es text "$1"; }
-cmd_cleartext()  { bc com.accessdroid.termux.ACTION_CLEAR_TEXT; }
-cmd_paste()      { bc com.accessdroid.termux.ACTION_PASTE; }
-cmd_focus()      { local t="${1:-}"; if [[ -n "$t" ]]; then bc com.accessdroid.termux.ACTION_FOCUS --es text "$t"; else bc com.accessdroid.termux.ACTION_FOCUS; fi; }
+# ---- acciones simples ----
+cmd_tap()        { cp_or_bc $ACTION_TAP $ACTION_TAP "i:x=${1:-0}" "i:y=${2:-0}" "l:duration=${3:-80}"; }
+cmd_longpress()  { cp_or_bc $ACTION_LONG_PRESS $ACTION_LONG_PRESS "i:x=${1:-0}" "i:y=${2:-0}" "l:duration=${3:-500}"; }
+cmd_swipe()      { cp_or_bc $ACTION_SWIPE $ACTION_SWIPE "i:x1=${1:-0}" "i:y1=${2:-0}" "i:x2=${3:-0}" "i:y2=${4:-0}" "l:duration=${5:-300}"; }
+cmd_scroll()     { local dir="${1:-down}"; if [[ "$dir" == "down" ]]; then cp_or_bc $ACTION_SCROLL_DOWN $ACTION_SCROLL_DOWN "i:x=${2:-0}" "i:y=${3:-0}"; else cp_or_bc $ACTION_SCROLL_UP $ACTION_SCROLL_UP "i:x=${2:-0}" "i:y=${3:-0}"; fi; }
+cmd_back()       { cp_or_bc $ACTION_BACK $ACTION_BACK; }
+cmd_home()       { cp_or_bc $ACTION_HOME $ACTION_HOME; }
+cmd_recents()    { cp_or_bc $ACTION_RECENTS $ACTION_RECENTS; }
+cmd_type()       { cp_or_bc $ACTION_TYPE $ACTION_TYPE "s:text=${1:-}"; }
+cmd_cleartext()  { cp_or_bc $ACTION_CLEAR_TEXT $ACTION_CLEAR_TEXT; }
+cmd_paste()      { cp_or_bc $ACTION_PASTE $ACTION_PASTE; }
+cmd_focus()      { local t="${1:-}"; if [[ -n "$t" ]]; then cp_or_bc $ACTION_FOCUS $ACTION_FOCUS "s:text=$t"; else cp_or_bc $ACTION_FOCUS $ACTION_FOCUS; fi; }
+cmd_click()      { cp_or_bc $ACTION_CLICK_TEXT $ACTION_CLICK_TEXT "s:text=${1:-}"; }
+cmd_clickid()    { cp_or_bc $ACTION_CLICK_ID $ACTION_CLICK_ID "s:id=${1:-}"; }
+cmd_scrollto()   { cp_or_bc $ACTION_SCROLL_TO $ACTION_SCROLL_TO "s:text=${1:-}"; }
+cmd_presskey()   {
+    local k="${1:-}" code=0
+    case "$k" in
+        back) code=4;; home) code=3;; recents) code=187;;
+        *) echo "only back|home|recents supported" >&2; return 1;;
+    esac
+    cp_or_bc $ACTION_PRESS_KEY $ACTION_PRESS_KEY "i:keyCode=$code"
+}
+
 cmd_openurl() {
     local url="${1:-}" app="${2:-}"
-    [[ -z "$url" ]] && { echo "uso: amctl openurl <url> [pkg-navegador]   (ej: openurl https://x.com com.android.chrome)" >&2; return 2; }
+    [[ -z "$url" ]] && { echo "uso: amctl openurl <url> [pkg-navegador]" >&2; return 2; }
+    CP_ARGS=""
+    cp_arg s uri "$url"
+    cp_arg i display "$DISPLAY_ID"
+    [[ -n "$app" ]] && cp_arg s package "$app"
+    if cp_call $ACTION_OPEN_URI "$(cp_encode_args)"; then
+        cp_report
+        return $?
+    fi
+    warn_legacy
+    detect_transport
     if [[ "$DISPLAY_ID" != "0" ]]; then
-        # Con -d N NO vale `tam start`: abriría en la pantalla 0 siempre.
-        # Va por el servicio, que sí sabe dirigir el launch a un display.
         local errf=/sdcard/Download/accessdroid-error.txt
-        rm -f "$errf"
-        if [[ -n "$app" ]]; then
-            cmd_launch "$app" || return 1   # el paquete manda: abre en dN
-        else
-            bc com.accessdroid.termux.ACTION_OPEN_URI --es uri "$url" --ei display "$DISPLAY_ID" || return 1
-            sleep 1
-            [[ -f "$errf" ]] && echo "⚠ $(cat "$errf")"
-        fi
+        rm -f "$errf" 2>/dev/null || true
+        bc $ACTION_OPEN_URI --es uri "$url" --ei display "$DISPLAY_ID"
+        sleep 1
+        [[ -f "$errf" ]] && echo "⚠ $(cat "$errf")"
         echo "openurl: $url (display $DISPLAY_ID)"
         return 0
     fi
     if tam start --user 0 -a android.intent.action.VIEW -d "$url" ${app:+-p "$app"} >/dev/null 2>&1; then
         echo "openurl: $url${app:+ -> $app}"
-    elif [[ -z "$app" ]] && bc com.accessdroid.termux.ACTION_OPEN_URI --es uri "$url"; then
-        echo "openurl: $url (via AccessDroid)"
     else
         echo "openurl failed for $url" >&2
         return 1
     fi
 }
+
+# ---- captura de pantalla ----
+cmd_ocr() {
+    # OCR de la captura: localiza texto que el árbol de accesibilidad no expone
+    # (canvas, WebView, botones custom de MIUI). Devuelve el centro en píxeles.
+    #   amctl find "texto" [conf] [--region x,y,w,h]
+    local needle="${1:-}" fresh="" minconf=55 region=""
+    [[ -z "$needle" ]] && { echo 'uso: amctl find "texto" [conf] [--region x,y,w,h]' >&2; return 2; }
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --region) region="${2:-}"; shift 2 ;;
+            --region=*) region="${1#*=}"; shift ;;
+            --conf) minconf="${2:-55}"; shift 2 ;;
+            ''|*[!0-9]*) shift ;;
+            *) minconf="$1"; shift ;;
+        esac
+    done
+    command -v tesseract >/dev/null 2>&1 || {
+        echo "tesseract no está instalado (pkg install tesseract)" >&2; return 1; }
+
+    local shot; shot=$(shot_file)
+    # captura fresca si no hay o es vieja (>15 s)
+    local age=999
+    [[ -f "$shot" ]] && age=$(( $(date +%s) - $(stat -c%Y "$shot" 2>/dev/null || echo 0) ))
+    if [[ "$age" -gt 15 ]]; then
+        cmd_shot >/dev/null 2>&1 || { echo "no se pudo capturar la pantalla" >&2; return 1; }
+    fi
+    [[ -f "$shot" ]] || { echo "no hay captura: $shot" >&2; return 1; }
+
+    # Recorte de la región de interés: el OCR sobre una franja es 10x más
+    # rápido que sobre la pantalla entera (17 s -> 2 s en un fotograma de video).
+    local work="$shot" factor=1 ox=0 oy=0
+    if command -v python3 >/dev/null 2>&1; then
+        local tmp="${TMPDIR:-/tmp}/amctl-ocr-$$.jpg" info
+        if [[ -n "$region" ]]; then
+            info=$(python3 - "$shot" "$tmp" "$region" <<'PYEOF' 2>/dev/null
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1])
+x, y, w, h = [int(v) for v in sys.argv[3].split(",")]
+im = im.crop((x, y, min(im.width, x + w), min(im.height, y + h)))
+im.save(sys.argv[2], quality=90)
+print(im.width, im.height, x, y)
+PYEOF
+)
+        else
+            info=$(python3 - "$shot" "$tmp" <<'PYEOF' 2>/dev/null
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1])
+w0 = im.width
+if w0 > 700:
+    im = im.resize((700, max(1, int(im.height * 700 / w0))))
+im.save(sys.argv[2], quality=85)
+print(im.width, im.height, 0, 0)
+PYEOF
+)
+        fi
+        if [[ -n "$info" ]]; then
+            local nw nh; nw=$(echo "$info" | awk '{print $1}'); nh=$(echo "$info" | awk '{print $2}')
+            ox=$(echo "$info" | awk '{print $3}'); oy=$(echo "$info" | awk '{print $4}')
+            work="$tmp"
+            if [[ -n "$region" ]]; then
+                factor=1   # el recorte ya está en píxeles reales: solo desplazamiento
+            else
+                local ow; ow=$(python3 -c "
+from PIL import Image; print(Image.open('$shot').width)" 2>/dev/null || echo 1080)
+                factor=$(awk "BEGIN{print ($ow>0)?$ow/$nw:1}")
+            fi
+        fi
+    fi
+
+    local n; n=$(printf '%s' "$needle" | tr 'A-ZÁÉÍÓÚÑ' 'a-záéíóúñ')
+    local out; out=$(tesseract "$work" stdout --psm 11 tsv 2>/dev/null | awk -F'\t' -v n="$n" -v mc="$minconf" -v k="$factor" -v ox="$ox" -v oy="$oy" '
+        NR>1 && $12!="" && $11!="" && $11+0>=mc {
+            t=tolower($12);
+            if (index(t,n)>0) {
+                cx=int(($7+int($9/2))*k+ox); cy=int(($8+int($10/2))*k+oy);
+                printf "%s\t%d\t%d\t%d\t%d\t%s\n", $12, cx, cy, $7, $8, $11;
+            }
+        }')
+    [[ "$work" != "$shot" ]] && rm -f "$work"
+    if [[ -z "$out" ]]; then
+        echo "no se encontró '$needle' en la captura (conf>=$minconf)"
+        return 1
+    fi
+    echo "$out" | while IFS=$'\t' read -r txt cx cy l t conf; do
+        echo "texto '$txt' en ($cx,$cy)  conf=$conf  ->  amctl tap $cx $cy"
+    done
+    return 0
+}
+
+cmd_shot() {
+    local out="" scale="" fmt="jpg"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scale) scale="${2:-}"; shift 2 ;;
+            --scale=*) scale="${1#*=}"; shift ;;
+            --png) fmt="png"; shift ;;
+            *) [[ -z "$out" ]] && out="$1"; shift ;;
+        esac
+    done
+    if [[ -z "$out" ]]; then
+        if [[ "$fmt" == "png" ]]; then
+            if [[ "$DISPLAY_ID" == "0" ]]; then out="/sdcard/Download/accessdroid-shot.png"
+            else out="/sdcard/Download/accessdroid-shot-d$DISPLAY_ID.png"; fi
+        else
+            out=$(shot_file)
+        fi
+    fi
+
+    CP_ARGS=""
+    cp_arg i displayId "$DISPLAY_ID"
+    [[ -n "$scale" ]] && cp_arg f scale "$scale"
+    [[ "$fmt" == "png" ]] && cp_arg s format png
+    if cp_call $ACTION_SCREENDUMP "$(cp_encode_args)"; then
+        if [[ "$CP_CODE" == "ok" && -n "$CP_B64" ]]; then
+            printf '%s' "$CP_B64" | base64 -d > "$out" 2>/dev/null
+            echo "captura: $out ($(stat -c%s "$out" 2>/dev/null || echo 0) bytes)"
+            return 0
+        fi
+        [[ -n "$CP_TEXT" ]] && echo "$CP_TEXT" >&2
+        return 1
+    fi
+
+    # legacy: la app escribe el fichero y lo leemos de ahí
+    warn_legacy
+    local base png
+    if [[ "$DISPLAY_ID" == "0" ]]; then
+        png=""; base="/sdcard/Download/accessdroid-shot"
+    else
+        base="/sdcard/Download/accessdroid-shot-d$DISPLAY_ID"; png=""
+    fi
+    rm -f "${base}.png" "${base}.jpg" 2>/dev/null || true
+    bc $ACTION_SCREENDUMP --ei displayId "$DISPLAY_ID"
+    local i
+    for i in $(seq 1 100); do
+        if [[ -f "${base}.jpg" ]]; then png="${base}.jpg"; break; fi
+        if [[ -f "${base}.png" ]]; then png="${base}.png"; break; fi
+        sleep 0.05
+    done
+    if [[ -n "$png" ]]; then
+        [[ "$png" != "$out" ]] && cp "$png" "$out" 2>/dev/null
+        echo "captura: $out ($(stat -c%s "$out" 2>/dev/null || echo 0) bytes)"
+    else
+        echo "(no se guardo la captura)" >&2
+        [[ -f /sdcard/Download/accessdroid-shot-error.txt ]] && { echo "error del servicio:"; cat /sdcard/Download/accessdroid-shot-error.txt; }
+        return 1
+    fi
+}
+
+# ---- tocar coordenadas vistas en una captura ----
 cmd_tapshot() {
     local png; png=$(shot_file)
-    [[ ! -f "$png" && "$DISPLAY_ID" == "0" ]] && png=/sdcard/Download/accessdroid-shot.png
-    [[ ! -f "$png" ]] && { echo "no hay screenshot: ejecuta primero amctl ${DISPLAY_ID:+-d $DISPLAY_ID }see" >&2; return 1; }
-    local dim
+    [[ ! -f "$png" ]] && png="/sdcard/Download/accessdroid-shot.png"
+    [[ ! -f "$png" ]] && { echo "no hay screenshot: ejecuta primero: amctl see" >&2; return 1; }
+    local dim pw ph
     dim=$(python3 - "$png" <<'PY'
 import struct, sys
-with open(sys.argv[1], "rb") as f:
-    f.seek(16)
-    w, h = struct.unpack(">II", f.read(8))
+data = open(sys.argv[1], "rb").read(4096)
+if data[:8] == b"\x89PNG\r\n\x1a\n":
+    w, h = struct.unpack(">II", data[16:24])
+else:
+    # JPEG: buscar el marcador SOF
+    w = h = 0
+    i = 2
+    while i < len(data) - 9:
+        if data[i] != 0xFF:
+            i += 1; continue
+        m = data[i+1]
+        if m in (0xC0,0xC1,0xC2,0xC3,0xC5,0xC6,0xC7,0xC9,0xCA,0xCB,0xCD,0xCE,0xCF):
+            h = struct.unpack(">H", data[i+5:i+7])[0]
+            w = struct.unpack(">H", data[i+7:i+9])[0]
+            break
+        i += 2 + struct.unpack(">H", data[i+2:i+4])[0]
 print(w, h)
 PY
-) || { echo "no pude leer el PNG" >&2; return 1; }
-    local pw ph; read -r pw ph <<<"$dim"
+) || { echo "no pude leer la imagen" >&2; return 1; }
+    read -r pw ph <<<"$dim"
     local x="${1:-}" y="${2:-}" wsi="${3:-}" hsi="${4:-}"
-    [[ -z "$x" || -z "$y" ]] && { echo "uso: amctl tapshot X Y [W H]  (X,Y vistos en la imagen, opcional su tamaño WxH)" >&2; return 2; }
+    [[ -z "$x" || -z "$y" ]] && { echo "uso: amctl tapshot X Y [W H]" >&2; return 2; }
     local sx=1.0 sy=1.0
     if [[ -n "$wsi" && "$wsi" != 0 ]]; then
         if [[ -z "$hsi" || "$hsi" == 0 ]]; then
-            sx=$(python3 -c "print($pw/$wsi)"); sy=$sx
+            sx=$(awk "BEGIN{print $pw/$wsi}"); sy=$sx
         else
-            sx=$(python3 -c "print($pw/$wsi)"); sy=$(python3 -c "print($ph/$hsi)")
+            sx=$(awk "BEGIN{print $pw/$wsi}"); sy=$(awk "BEGIN{print $ph/$hsi}")
         fi
     fi
     local tx ty
-    read -r tx ty < <(python3 -c "print(int($x*$sx+.5), int($y*$sy+.5))")
-    ac com.accessdroid.termux.ACTION_TAP --ei x "$tx" --ei y "$ty" --el duration 80
-    echo "tapshot ($x,$y)x(${sx}:${sy}) -> png ${pw}x${ph} -> tap ($tx,$ty)"
+    read -r tx ty < <(awk "BEGIN{print int($x*$sx+.5), int($y*$sy+.5)}")
+    cmd_tap "$tx" "$ty" 80
+    echo "tapshot ($x,$y)x(${sx}:${sy}) -> ${pw}x${ph} -> tap ($tx,$ty)"
 }
-cmd_click()      { bc com.accessdroid.termux.ACTION_CLICK_TEXT --es text "$1"; }
-cmd_clickid()    { bc com.accessdroid.termux.ACTION_CLICK_ID --es id "$1"; }
-cmd_scrollto()   { bc com.accessdroid.termux.ACTION_SCROLL_TO --es text "$1"; }
-cmd_shot()       { local f="${1:-$(shot_file)}"; local i; rm -f "$f" 2>/dev/null; for i in 1 2 3; do bc com.accessdroid.termux.ACTION_SCREENDUMP --ei displayId "$DISPLAY_ID"; sleep 2; [[ -f "$f" ]] && break; done; if [[ -f "$f" ]]; then echo "PNG: $f ($(stat -c%s "$f") bytes)"; else echo "(no se guardo el PNG)"; if [[ -f /sdcard/Download/accessdroid-shot-error.txt ]]; then echo "error del servicio:"; cat /sdcard/Download/accessdroid-shot-error.txt; fi; fi; }
-cmd_presskey()   { local k="$1"; local code=0; case "$k" in back) code=4;; home) code=3;; recents) code=187;; *) echo "only back|home|recents supported" >&2; return 1;; esac; bc com.accessdroid.termux.ACTION_PRESS_KEY --ei keyCode "$code"; }
 
-# display [on [w h dpi [nombre]] | off | status] — pantalla virtual del agente
-# Flags que entiende AOSP + el pseudo-flag 'mirror' (ver normalize_display_flags).
+# ---- pantalla virtual ----
 OVERLAY_FLAGS_RE='^(secure|own_content_only|should_show_system_decorations|gravity_top_left|gravity_top_right|gravity_bottom_left|gravity_bottom_right|mirror)$'
 
-# Normaliza y valida los flags de `display on`. Falla aquí (rápido, sin
-# broadcast) en vez de dejar que AOSP rechace el ajuste entero en silencio.
-# Acepta 'gravity_bottom_right', 'gravity_bottom_right,secure' o ambos sueltos.
 normalize_display_flags() {
-    local out="" tok seen
+    local out="" tok
     for tok in ${*//,/ }; do
         tok="${tok,,}"
         [[ -z "$tok" ]] && continue
@@ -353,65 +827,18 @@ normalize_display_flags() {
             echo "           gravity_top_left|top_right|bottom_left|bottom_right, mirror" >&2
             return 2
         fi
-        case ",$out," in *",$tok,"*) continue ;; esac     # sin duplicados
+        case ",$out," in *",$tok,"*) continue ;; esac
         out="${out:+$out,}$tok"
     done
     printf '%s' "$out"
 }
 
-# Espera a que el servicio escriba su informe de displays. 0 = apareció.
-wait_report() {
-    local f=$1 i
-    for i in 1 2 3 4 5 6; do sleep 1; [[ -f "$f" ]] && return 0; done
-    return 1
-}
-
-# Imprime la línea de error/aviso de la operación anterior (on/off), si la hay.
-# Sin esto el aviso se perdería: el refresco de estado pisa el informe.
-report_problem() {
-    local f=$1 line
-    [[ -f "$f" ]] || return 0
-    while IFS= read -r line; do
-        case "$line" in error=*) echo "✗ ${line#error=}" ;; esac
-    done < "$f"
-}
-
-cmd_display() {
-    local op="${1:-status}"
-    local f=/sdcard/Download/accessdroid-displays.txt
-    local i
-    case "$op" in
-        on)
-            # $2=ancho $3=alto $4=dpi $5..=flags (uno o varios, con o sin comas)
-            local flags
-            flags="$(normalize_display_flags "${@:5}")" || return 2
-            rm -f "$f"    # limpio antes, para no leer un informe viejo
-            bc com.accessdroid.termux.ACTION_DISPLAY --es op on \
-               --ei width "${2:-1080}" --ei height "${3:-1920}" --ei density "${4:-320}" \
-               --es flags "$flags"
-            sleep 2      # el display se crea asíncrono (~1s)
-            wait_report "$f" || true
-            report_problem "$f"
-            ;;
-        off)
-            rm -f "$f"
-            bc com.accessdroid.termux.ACTION_DISPLAY --es op off
-            sleep 1
-            wait_report "$f" || true
-            report_problem "$f"
-            ;;
-        status) ;;
-        *) echo "uso: amctl display [on [ancho alto dpi [flags...]] | off | status]" >&2; return 2 ;;
-    esac
-    rm -f "$f"
-    bc com.accessdroid.termux.ACTION_DISPLAY --es op status
-    wait_report "$f" || { echo "(⚠ el servicio no respondió — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2; return 1; }
-    local line first=1
+print_displays() {
+    local line id nm sz dp st wn first=1
     while IFS= read -r line; do
         case "$line" in
             error=*) echo "✗ ${line#error=}" ;;
             display=*) first=0
-                local id nm sz dp st wn
                 id=${line#display=};      id=${id%% *}
                 nm=${line#*name=};        nm=${nm%% *}
                 sz=${line#*size=};        sz=${sz%% *}
@@ -421,40 +848,130 @@ cmd_display() {
                 printf "  d%-3s %-14s %-10s %-5s %-4s ventanas:%s\n" "$id" "$nm" "$sz" "$dp" "$st" "$wn" ;;
             overlay=*) [[ $first == 1 ]] || echo "  ajuste overlay_display_devices: ${line#overlay=}" ;;
         esac
-    done < "$f"
+    done
+}
+
+cmd_display() {
+    local op="${1:-status}"
+    local w="${2:-1080}" h="${3:-1920}" dpi="${4:-320}" flags="${5:-}"
+
+    if [[ "$op" == "on" ]]; then
+        flags="$(normalize_display_flags "${@:5}")" || return 2
+    fi
+
+    CP_ARGS=""
+    cp_arg s op "$op"
+    cp_arg i width "$w"
+    cp_arg i height "$h"
+    cp_arg i density "$dpi"
+    [[ -n "$flags" ]] && cp_arg s flags "$flags"
+    if cp_call $ACTION_DISPLAY "$(cp_encode_args)"; then
+        print_displays <<<"$CP_TEXT"
+        [[ "$CP_CODE" == "ok" ]] && return 0
+        return 1
+    fi
+
+    # legacy
+    warn_legacy
+    local f=/sdcard/Download/accessdroid-displays.txt
+    rm -f "$f" 2>/dev/null || true
+    if [[ "$op" == "on" ]]; then
+        bc $ACTION_DISPLAY --es op on --ei width "$w" --ei height "$h" --ei density "$dpi" --es flags "$flags"
+    elif [[ "$op" == "off" ]]; then
+        bc $ACTION_DISPLAY --es op off
+    else
+        bc $ACTION_DISPLAY --es op status
+    fi
+    if wait_file "$f" 8; then
+        print_displays < "$f"
+    else
+        echo "(⚠ el servicio no respondió — actívalo en Ajustes → Accesibilidad → CostPhone)" >&2
+        return 1
+    fi
     return 0
 }
 
-# float <texto>: recents -> tarjeta de la app (por texto) -> long-press -> 'ventanas flotantes'
-# (flujo MIUI/HyperOS verificado: recents, longpress en tarjeta, menu_item_small_window)
+# ---- ventana flotante (flujo MIUI: recents -> long-press -> menu) ----
 cmd_float() {
     local target="${1:-}"
     local pkg="${2:-}"
-    [[ -z "$target" ]] && { echo "uso: amctl float <texto-tarjeta-en-recents> [pkg]   (ej: amctl float Termux — si no está en recents, láncala con: amctl float Galeria com.miui.gallery)" >&2; return 2; }
-    shift 2; local extra="${1:-}"   # 3er arg: 'split' -> pantalla dividida
+    [[ -z "$target" ]] && { echo "uso: amctl float <texto-tarjeta-en-recents> [pkg]" >&2; return 2; }
+    shift 2 || true
+    local extra="${1:-}"
     local t="${target,,}"
-    bc com.accessdroid.termux.ACTION_RECENTS; sleep 2
+    cmd_recents; sleep 1
     local out row
     out=$(cmd_snap 2>/dev/null)
     row=$(printf '%s\n' "$out" | awk -v t="$t" 'tolower($0) ~ t && /^@p[0-9]+ \[Frame/ {print; exit}')
     if [[ -z "$row" && -n "$pkg" ]]; then
-        cmd_launch "$pkg" >/dev/null 2>&1; sleep 4
-        bc com.accessdroid.termux.ACTION_RECENTS; sleep 2
+        cmd_launch "$pkg" >/dev/null 2>&1; sleep 3
+        cmd_recents; sleep 1
         out=$(cmd_snap 2>/dev/null)
         row=$(printf '%s\n' "$out" | awk -v t="$t" 'tolower($0) ~ t && /^@p[0-9]+ \[Frame/ {print; exit}')
     fi
-    [[ -z "$row" ]] && { echo "amctl float: no encontré la tarjeta '$target' en recents (¿está abierta la app? usa el pkg como 2do arg)" >&2; return 1; }
+    [[ -z "$row" ]] && { echo "amctl float: no encontré la tarjeta '$target' en recents" >&2; return 1; }
     read -r cx cy <<<"$(printf '%s' "$row" | sed -E 's/.*\(([0-9]+),([0-9]+)\).*/\1 \2/')"
-    cmd_longpress "$cx" "$cy" 700 >/dev/null; sleep 2
+    cmd_longpress "$cx" "$cy" 700 >/dev/null; sleep 1
     out=$(cmd_snap 2>/dev/null)
     local want="menu_item_small_window"
     [[ "$extra" == 'split' ]] && want="menu_item_multi_window"
     row=$(printf '%s\n' "$out" | awk -v w="$want" '$0 ~ w {print; exit}')
-    [[ -z "$row" ]] && { row=$(printf '%s\n' "$out" | awk 'tolower($0) ~ /ventanas flotantes/ {print; exit}'); }
-    [[ -z "$row" ]] && { echo "amctl float: la app no ofrece ventana flotante en MIUI, pruebalo manual o usa 'float <texto> split'" >&2; return 1; }
+    [[ -z "$row" ]] && row=$(printf '%s\n' "$out" | awk 'tolower($0) ~ /ventanas flotantes/ {print; exit}')
+    [[ -z "$row" ]] && { echo "amctl float: la app no ofrece ventana flotante" >&2; return 1; }
     read -r cx cy <<<"$(printf '%s' "$row" | sed -E 's/.*\(([0-9]+),([0-9]+)\).*/\1 \2/')"
-    ac com.accessdroid.termux.ACTION_TAP --ei x "$cx" --ei y "$cy" --el duration 80
+    cmd_tap "$cx" "$cy" 80
     echo "float: $target -> ventana flotante"
+}
+
+# ---- diagnóstico del canal ----
+cmd_status() {
+    CP_ARGS=""
+    if cp_call $ACTION_PING ""; then
+        echo "canal rápido: OK (127.0.0.1, respuesta: ${CP_TEXT:-sin cuerpo})"
+        CP_ARGS=""; cp_arg i display "$DISPLAY_ID"
+        if cp_call $ACTION_GET_SNAPSHOT "$(cp_encode_args)"; then
+            echo "display $DISPLAY_ID: ${CP_TEXT%%$'\n'*}"
+        fi
+        return 0
+    fi
+    echo "canal rápido: NO disponible"
+    detect_transport
+    echo "transporte legacy: $TRANSPORT  (am clásico = cada orden 1-5s)"
+    echo "→ instala la app v1.3+ y reactiva Ajustes → Accesibilidad → CostPhone"
+    return 1
+}
+
+# ---- activar el servicio de accesibilidad (tras una actualización) ----
+cmd_enable() {
+    CP_ARGS=""
+    if cp_call $ACTION_ENABLE_SERVICE "$(cp_encode_args)"; then
+        cp_report
+        return $?
+    fi
+    # sin canal rápido: el receptor del manifest responde al broadcast y deja
+    # el resultado en un fichero, que es la única forma de enterarse por aquí.
+    warn_legacy
+    detect_transport
+    local rep="/sdcard/Download/accessdroid-enable.txt"
+    rm -f "$rep" 2>/dev/null || true
+    bc $ACTION_ENABLE_SERVICE
+    if wait_file "$rep" 6; then
+        local txt; txt=$(head -c 300 "$rep" | tr '\n' ' ')
+        echo "informe: $txt"
+        case "$txt" in
+            *WRITE_SECURE_SETTINGS*)
+                echo "→ la app no puede activarse sola (permiso de sistema). Abro Ajustes → Accesibilidad → CostPhone:"
+                am start -a android.settings.ACCESSIBILITY_SETTINGS >/dev/null 2>&1 || \
+                    termux-open "intent:#Intent;action=android.settings.ACCESSIBILITY_SETTINGS;end" >/dev/null 2>&1 || \
+                    echo "   (abre Ajustes → Accesibilidad → CostPhone a mano)"
+                ;;
+            OK*) sleep 1; if cp_port >/dev/null 2>&1; then echo "✓ servicio activo (canal rápido disponible)"; fi ;;
+        esac
+    else
+        echo "sin informe de la app (¿versión < 1.3?) — activa el servicio en"
+        echo "Ajustes → Accesibilidad → CostPhone"
+    fi
+    return 0
 }
 
 # ========================= dispatcher =========================
@@ -473,8 +990,9 @@ case "${1:-help}" in
     clear)     cmd_clear "${2:-}" ;;
     tree)      cmd_tree ;;
     snap)      shift; cmd_snap "$@" ;;
-    tapref)    cmd_tapref "${2:-}" "${3:-}" ;;
-    tap)       cmd_tap "${2:-}" "${3:-}" "${4:-80}" ;;
+    tapref)    shift; cmd_tapref "$@" ;;
+    waitfor)   shift; cmd_waitfor "$@" ;;
+    tap)       cmd_tap "${2:-0}" "${3:-0}" "${4:-80}" ;;
     longpress) cmd_longpress "${2:-0}" "${3:-0}" "${4:-500}" ;;
     swipe)     cmd_swipe "${2:-0}" "${3:-0}" "${4:-0}" "${5:-0}" "${6:-300}" ;;
     scroll)    cmd_scroll "${2:-down}" "${3:-0}" "${4:-0}" ;;
@@ -486,17 +1004,20 @@ case "${1:-help}" in
     cleartext) cmd_cleartext ;;
     paste)     cmd_paste ;;
     focus)     cmd_focus "${2:-}" ;;
-    openurl)   cmd_openurl "${2:-}" ;;
+    openurl)   cmd_openurl "${2:-}" "${3:-}" ;;
     tapshot)   cmd_tapshot "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
     click)     cmd_click "${2:-}" ;;
     clickid)   cmd_clickid "${2:-}" ;;
     scrollto)  cmd_scrollto "${2:-}" ;;
-    screenshot) cmd_shot "${2:-}" ;;
-    shot)      cmd_shot "${2:-}" ;;
-    see)       cmd_shot "${2:-}" ;;
+    screenshot) shift; cmd_shot "$@" ;;
+    shot)      shift; cmd_shot "$@" ;;
+    see)       shift; cmd_shot "$@" ;;
+    ocr)       shift; cmd_ocr "$@" ;;
     presskey)  cmd_presskey "${2:-}" ;;
     display)   shift; cmd_display "$@" ;;
     displays)  cmd_display status ;;
+    status)    cmd_status ;;
+    enable)    cmd_enable ;;
     help|-h|--help)
         awk '/^#====/{c++; if(c==2) exit} c>=1{print}' "$0" | sed 's/^# \{0,1\}//' ;;
     *) echo "unknown command: $1 (use 'amctl help')" >&2; exit 1 ;;

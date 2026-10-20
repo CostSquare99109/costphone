@@ -137,13 +137,60 @@ public class SettingsActivity extends Activity {
         root.addView(tip, lpWRAP(24));
 
         TextView ver = new TextView(this);
-        ver.setText("CostPhone · v1.2");
+        ver.setText("CostPhone · v" + appVersion());
         ver.setTextSize(12);
         ver.setTextColor(0xFF546E7A);
         ver.setGravity(Gravity.CENTER);
         root.addView(ver, lpWRAP(0));
 
+        TextView chan = new TextView(this);
+        chan.setText("canal rápido: comprobando…");
+        chan.setTextSize(12);
+        chan.setTextColor(0xFF546E7A);
+        chan.setGravity(Gravity.CENTER);
+        root.addView(chan, lpWRAP(6));
+        checkFastChannel(chan);
+
         setContentView(scroll);
+    }
+
+    /** Versión real de la app instalada (no un literal en el código). */
+    private String appVersion() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "?";
+        }
+    }
+
+    /** ¿hay alguien escuchando en el puerto del canal rápido? */
+    private void checkFastChannel(final TextView view) {
+        new Thread(new Runnable() {
+            @Override public void run() {
+                boolean up = false;
+                int[] ports = {39871, 39872, 39873, 39874, 39875};
+                for (int p : ports) {
+                    java.net.Socket s = null;
+                    try {
+                        s = new java.net.Socket();
+                        s.connect(new java.net.InetSocketAddress("127.0.0.1", p), 300);
+                        up = true;
+                    } catch (Exception e) {
+                        // siguiente puerto
+                    } finally {
+                        try { if (s != null) s.close(); } catch (Exception ignored) { }
+                    }
+                    if (up) break;
+                }
+                final boolean ok = up;
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        view.setText(ok ? "canal rápido: activo" : "canal rápido: no disponible");
+                        view.setTextColor(ok ? 0xFF34C759 : 0xFF8B97AD);
+                    }
+                });
+            }
+        }, "cp-check").start();
     }
 
     @Override protected void onResume() {
