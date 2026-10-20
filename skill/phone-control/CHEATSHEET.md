@@ -24,9 +24,9 @@ En un teléfono **cada `exec` de un binario cuesta ~150 ms**: `amctl` es un scri
 | **Verificar canal** | `amctl status \| head -1` | 0.25s | "canal rápido: OK" = todo verde |
 | **Pre-calentar** | `amctl warmup` | 0.02s | Cachea el puerto |
 | **Reactivar servicio** | `amctl enable` | 1-2s | Tras actualizar la app (Android lo desactiva) |
-| **Abrir app** | `amctl launch com.pkg` | 0.3s | Por nombre: `amctl launch whatsapp` |
+| **Abrir app** | `amctl launch com.pkg` | 0.3s | Por nombre: `amctl launch whatsapp` (lo resuelve la app) |
 | **Buscar apps** | `amctl list` · `amctl find <pkg>` | 0.5s | Lista / busca por paquete |
-| **Abrir URL** | `amctl openurl "https://…"` | 0.4s | Evita el omnibox; `openurl <url> com.android.chrome` fuerza browser |
+| **Abrir URL** | `amctl openurl "https://…"` | 0.4s | Evita el omnibox; `amctl openurl <url> com.android.chrome` fuerza browser |
 | **Esperar texto real** | `amctl waitfor "texto" 10000` | 0.1-2.4s | **Devuelve snapshot con refs** — nunca uses `sleep` |
 | **Ver pantalla (filtro)** | `amctl snap --filter "chat"` | 0.25s | Menos ruido, refs @pN frescas |
 | **Ver todo (texto + interactivos)** | `amctl snap -a` | 0.3s | Pantallas densas |
@@ -34,16 +34,16 @@ En un teléfono **cada `exec` de un binario cuesta ~150 ms**: `amctl` es un scri
 | **Click por texto** | `amctl click "Enviar"` | 0.24s | ⚠ ver trampas 1-2 |
 | **Click por id** | `amctl clickid send` | 0.23s | Id corto del snapshot (`#send` → `clickid send`) — **lo más estable** |
 | **Tocar ref** | `amctl tapref @p3 --settle 500` | 0.2s | El settle lo duerme el servidor |
-| **Tocar coordenadas** | `amctl tap X Y [ms]` · `longpress X Y [ms]` | 0.15s | `longpress` = 500 ms por defecto |
+| **Tocar coordenadas** | `amctl tap X Y [ms]` · `amctl longpress X Y [ms]` | 0.15s | `longpress` = 500 ms por defecto |
 | **Escribir (reemplaza)** | `amctl type "texto" [ms]` | 0.2s | setText **borra** lo anterior; verifica que aparezca |
-| **Vaciar / pegar / enfocar** | `amctl cleartext` · `paste` · `focus "texto"` | 0.2s | `focus` busca texto o descripción |
+| **Vaciar / pegar / enfocar** | `amctl cleartext` · `amctl paste` · `amctl focus "texto"` | 0.2s | `focus` busca texto o descripción |
 | **Scroll semántico** | `amctl scroll down\|up [x y]` | 0.2s | La app desplaza su lista |
 | **Scroll a un texto** | `amctl scrollto "texto"` | 0.2s | Busca y desplaza hasta él |
 | **Swipe bruto** | `amctl swipe X1 Y1 X2 Y2 [ms]` | 0.2s | Para feeds (donde `scroll` falla) |
-| **Back / Home / Recents** | `amctl back` / `home` / `recents` · `presskey back` | 0.15s | `back` sí tiene versión `-d`; los demás son globales |
+| **Back / Home / Recents** | `amctl back` / `amctl home` / `amctl recents` · `amctl presskey back` | 0.15s | `back` sí tiene versión `-d`; los demás son globales |
 | **Varias órdenes (1 proceso)** | `amctl batch "home; back; snap"` | 1 exec | 3 órdenes: 2.2s → 0.44s |
 | **OCR (canvas/WebView)** | `amctl ocr "Actualizar" --region 700,1300,300,120` | 2-3s | Último recurso; sin `--region` ~19s |
-| **Captura JPEG** | `amctl see` | 0.7s | Lee la imagen con `read`; `tapshot X Y W H` para tocar |
+| **Captura JPEG** | `amctl see` | 0.7s | Lee la imagen con `read`; `amctl tapshot X Y W H` para tocar |
 | **Ventana flotante (MIUI)** | `amctl float "texto" [pkg]` | 1-2s | recents → long-press → flotante |
 | **Display virtual ON** | `amctl display on 1080 1920 320` | 1-2s | Luego `amctl displays` para saber el ID real |
 | **Comando en display N** | `amctl -d 2 snap` | igual | Flag `-d`, no subcomando |

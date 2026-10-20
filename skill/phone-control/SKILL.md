@@ -178,7 +178,7 @@ sistema). Ya no hay que adivinar coordenadas del teclado: Enter y ⌫ son refs.
 | `amctl focus "texto"` | Da foco a un campo cuyo **texto o descripción** contenga ese texto |
 | `amctl openurl <url>` | Navega al URL en el Chrome default — SIN pelear con el omnibox (mejor que tap URL + type + Enter) |
 | `amctl float <texto> [pkg]` | Pon la app en ventana flotante (recents → long-press → "ventanas flotantes" de MIUI). `float X pkg Y split` = pantalla dividida |
-| `amctl back` / `home` / `recents` | Botones del sistema |
+| `amctl back` / `amctl home` / `amctl recents` | Botones del sistema |
 | `amctl launch <pkg>` | Abre app |
 | `amctl scrollto "texto"` | Busca y hace scroll a un texto |
 
