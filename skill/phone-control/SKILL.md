@@ -3,6 +3,8 @@ name: phone-control
 description: "Control del teléfono Android del usuario desde Termux con amctl (servicio de accesibilidad CostPhone): leer la pantalla como texto, snapshot con refs @pN, tap por referencia, click por texto/id, escribir, swipe, lanzar apps, capturas. Úsala cuando el usuario pida hacer algo en su teléfono (WhatsApp, Instagram, Facebook/Meta Business, ajustes, cualquier app), ver qué hay en pantalla, o automatizar la UI de Android. English: control the user's Android phone."
 ---
 
+> **⚡ CHEAT SHEET**: Ver [CHEATSHEET.md](CHEATSHEET.md) — comandos clave en 30 líneas
+
 # phone-control — el teléfono como un navegador
 
 Equivalente móvil de agent-browser. El CLI es `amctl` (~/bin/amctl), que habla
