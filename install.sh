@@ -60,11 +60,33 @@ echo "     listo: $BIN/amctl"
 # --- 4. Skill para OpenCode ------------------------------------------------
 step "4/6  Instalando la skill 'phone-control' para OpenCode..."
 if [ -d "$HOME/.config/opencode" ]; then
+    SRC="$REPO_DIR/skill/phone-control"
+    mkdir -p "$(dirname "$SKILL_DIR")"
+    # Symlinks POR ARCHIVO dentro de un directorio real (no un symlink del
+    # directorio completo): OpenCode descubre skills con
+    # scan("{*.md,**/SKILL.md}", {symlink:true}) -> follow:true (atraviesa
+    # symlinks), pero su segundo escaneo de archivos extra del skill
+    # (scan("**/*", {cwd:<dir del skill>})) NO lleva symlink -> follow:false,
+    # y un directorio symlinkeado devolveria 0 archivos (se perderia
+    # CHEATSHEET.md). Con symlinks por archivo funcionan ambos.
+    if [ -L "$SKILL_DIR" ]; then
+        rm -f "$SKILL_DIR"                       # symlink de directorio previo
+    fi
     mkdir -p "$SKILL_DIR"
-    # copia TODA la skill (SKILL.md + CHEATSHEET.md + futuros archivos):
-    # el cheat sheet se enlaza por ruta relativa, si falta el link se rompe.
-    cp -r "$REPO_DIR/skill/phone-control/." "$SKILL_DIR/"
-    echo "     listo: $SKILL_DIR/ ($(ls -1 "$SKILL_DIR" | tr '\n' ' '))"
+    for f in "$SRC"/*; do
+        [ -f "$f" ] || continue
+        b="$(basename "$f")"
+        rm -rf "$SKILL_DIR/$b" 2>/dev/null
+        ln -s "$f" "$SKILL_DIR/$b" 2>/dev/null || cp "$f" "$SKILL_DIR/$b"
+    done
+    # quita lo que ya no exista en el repo (symlinks rotos / restos)
+    for f in "$SKILL_DIR"/*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        b="$(basename "$f")"
+        [ -e "$SRC/$b" ] || rm -rf "$f"
+    done
+    echo "     listo: $SKILL_DIR/ ($(ls -1 "$SKILL_DIR" 2>/dev/null | tr '\n' ' '))"
+    echo "     (symlinks a $SRC — siempre al día con el repo)"
 else
     warn "No hay ~/.config/opencode (¿OpenCode no instalado?) — skill omitida"
 fi

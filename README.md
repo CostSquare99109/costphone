@@ -88,7 +88,10 @@ El instalador hace **todo**:
 2. Modifica el **`am` de Termux**: activa `run-termux-am-socket-server` en
    `~/.termux/termux.properties` y agrega `~/bin` al `PATH`.
 3. Copia `amctl` y `amctl-snap.py` a `~/bin`.
-4. Instala la skill `phone-control` en `~/.config/opencode/skills/android/`.
+4. Instala la skill `phone-control` en `~/.config/opencode/skills/android/`
+   como **symlinks por archivo** al repo: la skill del repo y la de OpenCode
+   son siempre la misma (nada de copias desactualizadas). Si el filesystem no
+   admite symlinks, cae a copia.
 5. Registra la skill en `~/.config/opencode/AGENTS.md`.
 6. Abre el instalador del **APK**. En el teléfono:
    - Toca **Instalar** (si Play Protect avisa → *Entendido*).
