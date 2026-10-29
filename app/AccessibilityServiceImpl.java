@@ -1015,7 +1015,6 @@ public class AccessibilityServiceImpl extends AccessibilityService {
      */
     private CpRes scrollUntil(String needle, int displayId, int maxScrolls) {
         int max = Math.max(1, Math.min(maxScrolls, 40));
-        String prev = null;
         for (int i = 0; i <= max; i++) {
             List<Snap.Node> nodes = new ArrayList<>();
             collect(displayId, nodes, System.currentTimeMillis() + DUMP_BUDGET_MS, true);
@@ -1028,11 +1027,6 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                         + ") tras " + i + " scroll(s)");
             }
             String sig = sigOf(nodes, displayId);
-            if (sig.equals(prev)) {
-                return CpRes.fail("no se encontró '" + needle + "': fin de la lista tras "
-                        + i + " scroll(s)");
-            }
-            prev = sig;
             if (!scrollSemantic(-1, -1, true, displayId)) {
                 // Muchas apps (MIUI Settings, p.ej.) no marcan su lista como
                 // scrollable en el árbol: sin este respaldo, scrollto se
@@ -1041,7 +1035,21 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 run(makeScroll(dm.widthPixels / 2, (int)(dm.heightPixels * 0.6f),
                         -0.45f, displayId), "scrollTo");
             }
-            nap(180);
+            // Esperar a que la lista REDIBUJE, no a un tiempo fijo: comparar
+            // la firma 180 ms después daba "fin de lista" en la primera
+            // pantalla porque el RecyclerView aún no había creado las filas.
+            boolean moved = false;
+            long t0 = System.currentTimeMillis();
+            while (System.currentTimeMillis() - t0 < 1200) {
+                nap(80);
+                List<Snap.Node> chk = new ArrayList<>();
+                collect(displayId, chk, System.currentTimeMillis() + 1500, true);
+                if (!sigOf(chk, displayId).equals(sig)) { moved = true; break; }
+            }
+            if (!moved) {
+                return CpRes.fail("no se encontró '" + needle + "': fin de la lista tras "
+                        + i + " scroll(s)");
+            }
         }
         return CpRes.fail("no se encontró '" + needle + "' tras " + max + " scroll(s)");
     }
