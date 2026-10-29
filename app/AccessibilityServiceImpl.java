@@ -994,15 +994,16 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     private String uiSignature(int displayId) {
         List<Snap.Node> nodes = new ArrayList<>();
         collect(displayId, nodes, System.currentTimeMillis() + 1500, true);
+        List<Snap.Node> pool = mainOnScreen(nodes, displayId);
         long h = 1125899906842597L;
-        for (int i = 0; i < nodes.size(); i++) {
-            Snap.Node n = nodes.get(i);
+        for (int i = 0; i < pool.size(); i++) {
+            Snap.Node n = pool.get(i);
             h = 31 * h + n.depth;
             h = 31 * h + (n.txt.isEmpty() ? n.desc : n.txt).hashCode();
             h = 31 * h + n.vid.hashCode();
             h = 31 * h + n.l * 7L + n.t;
         }
-        return pkgOf(displayId) + "/" + nodes.size() + "/" + Long.toHexString(h);
+        return pkgOf(displayId) + "/" + pool.size() + "/" + Long.toHexString(h);
     }
 
     /**
@@ -1019,14 +1020,19 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             List<Snap.Node> nodes = new ArrayList<>();
             collect(displayId, nodes, System.currentTimeMillis() + DUMP_BUDGET_MS, true);
             if (nodes.isEmpty()) return CpRes.fail("no hay ventana activa");
-            Snap.Index idx = Snap.index(nodes);
+            // Solo la ventana principal: la barra de estado tiene el reloj y
+            // el velocímetro de red, que cambian solos. Sin este filtro,
+            // scrollto encontraba un "YouTube" de una notificación en (341,50)
+            // y creía que la lista se movía en cada vuelta.
+            List<Snap.Node> pool = mainOnScreen(nodes, displayId);
+            Snap.Index idx = Snap.index(pool);
             int hit = Snap.findMatch(idx, needle);
             if (hit >= 0) {
-                Snap.Node nd = nodes.get(hit);
+                Snap.Node nd = pool.get(hit);
                 return CpRes.ok("scroll hasta '" + needle + "' -> (" + nd.cx() + "," + nd.cy()
                         + ") tras " + i + " scroll(s)");
             }
-            String sig = sigOf(nodes, displayId);
+            String sig = sigOf(pool, displayId);
             // El punto importa: scrollSemantic(-1,-1) se queda con el nodo
             // desplazable de mayor área, que en pantallas con cabecera
             // (MIUI) no es la lista. Con el centro acierta, igual que
@@ -1048,7 +1054,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 nap(80);
                 List<Snap.Node> chk = new ArrayList<>();
                 collect(displayId, chk, System.currentTimeMillis() + 1500, true);
-                if (!sigOf(chk, displayId).equals(sig)) { moved = true; break; }
+                if (!sigOf(mainOnScreen(chk, displayId), displayId).equals(sig)) { moved = true; break; }
             }
             if (!moved) {
                 return CpRes.fail("no se encontró '" + needle + "': fin de la lista tras "
@@ -1056,6 +1062,21 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             }
         }
         return CpRes.fail("no se encontró '" + needle + "' tras " + max + " scroll(s)");
+    }
+
+    /** Nodos de la ventana principal que se ven en pantalla. */
+    private List<Snap.Node> mainOnScreen(List<Snap.Node> nodes, int displayId) {
+        android.util.DisplayMetrics dm = metricsOf(displayId);
+        List<Snap.Node> out = new ArrayList<>();
+        for (int i = 0; i < nodes.size(); i++) {
+            Snap.Node nd = nodes.get(i);
+            if (!nd.win.isEmpty()) continue;      // sys (barra), ime, overlays
+            int cx = nd.cx(), cy = nd.cy();
+            if (cx < 0 || cx > dm.widthPixels) continue;
+            if (cy < 0 || cy > dm.heightPixels) continue;
+            out.add(nd);
+        }
+        return out;
     }
 
     /**
