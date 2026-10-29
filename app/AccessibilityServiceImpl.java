@@ -430,7 +430,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             case ACTION_SCROLL_TO: {
                 String txt = intent.getStringExtra("text");
                 if (txt == null || txt.isEmpty()) return CpRes.fail("texto vacío");
-                return scrollUntil(txt, disp(intent), intent.getIntExtra("max", 10));
+                return scrollUntil(txt, disp(intent), intent.getIntExtra("max", 20));
             }
             case ACTION_GET_UI_TREE: {
                 int d = disp(intent);

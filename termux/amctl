@@ -668,7 +668,7 @@ cmd_paste()      { cp_or_bc $ACTION_PASTE $ACTION_PASTE; }
 cmd_focus()      { local t="${1:-}"; if [[ -n "$t" ]]; then cp_or_bc $ACTION_FOCUS $ACTION_FOCUS "s:text=$t"; else cp_or_bc $ACTION_FOCUS $ACTION_FOCUS; fi; }
 cmd_click()      { cp_or_bc $ACTION_CLICK_TEXT $ACTION_CLICK_TEXT "s:text=${1:-}"; }
 cmd_clickid()    { cp_or_bc $ACTION_CLICK_ID $ACTION_CLICK_ID "s:id=${1:-}"; }
-cmd_scrollto()   { cp_or_bc $ACTION_SCROLL_TO $ACTION_SCROLL_TO "s:text=${1:-}" "i:max=${2:-10}"; }
+cmd_scrollto()   { cp_or_bc $ACTION_SCROLL_TO $ACTION_SCROLL_TO "s:text=${1:-}" "i:max=${2:-20}"; }
 cmd_presskey()   {
     local k="${1:-}" code=0
     case "$k" in
@@ -1103,7 +1103,7 @@ case "${1:-help}" in
     tapshot)   cmd_tapshot "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
     click)     cmd_click "${2:-}" ;;
     clickid)   cmd_clickid "${2:-}" ;;
-    scrollto)  shift; cmd_scrollto "${1:-}" "${2:-10}" ;;
+    scrollto)  shift; cmd_scrollto "${1:-}" "${2:-20}" ;;
     screenshot) shift; cmd_shot "$@" ;;
     shot)      shift; cmd_shot "$@" ;;
     see)       shift; cmd_shot "$@" ;;
