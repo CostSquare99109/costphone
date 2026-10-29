@@ -1027,13 +1027,17 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                         + ") tras " + i + " scroll(s)");
             }
             String sig = sigOf(nodes, displayId);
-            if (!scrollSemantic(-1, -1, true, displayId)) {
-                // Muchas apps (MIUI Settings, p.ej.) no marcan su lista como
-                // scrollable en el árbol: sin este respaldo, scrollto se
-                // rendía en la primera pantalla.
-                android.util.DisplayMetrics dm = metricsOf(displayId);
-                run(makeScroll(dm.widthPixels / 2, (int)(dm.heightPixels * 0.6f),
-                        -0.45f, displayId), "scrollTo");
+            // El punto importa: scrollSemantic(-1,-1) se queda con el nodo
+            // desplazable de mayor área, que en pantallas con cabecera
+            // (MIUI) no es la lista. Con el centro acierta, igual que
+            // 'amctl scroll down'.
+            android.util.DisplayMetrics dm = metricsOf(displayId);
+            int cx = dm.widthPixels / 2;
+            int cy = (int)(dm.heightPixels * 0.5f);
+            if (!scrollSemantic(cx, cy, true, displayId)) {
+                // Muchas apps no marcan su lista como scrollable en el árbol:
+                // sin este respaldo, scrollto se rendía en la primera pantalla.
+                run(makeScroll(cx, (int)(dm.heightPixels * 0.6f), -0.45f, displayId), "scrollTo");
             }
             // Esperar a que la lista REDIBUJE, no a un tiempo fijo: comparar
             // la firma 180 ms después daba "fin de lista" en la primera
@@ -1054,14 +1058,26 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         return CpRes.fail("no se encontró '" + needle + "' tras " + max + " scroll(s)");
     }
 
+    /**
+     * Firma del CONTENIDO (textos + ids), sin posiciones.
+     *
+     * Para saber si una lista se movió no sirven las coordenadas: el toolbar
+     * que colapsa cambia los bounds de todo sin que la lista avance, y eso
+     * hacía que scrollto diese 25 vueltas sin moverse. Lo que cambia al
+     * desplazar son los textos visibles.
+     */
     private String sigOf(List<Snap.Node> nodes, int displayId) {
         long h = 1125899906842597L;
+        int n = 0;
         for (int i = 0; i < nodes.size(); i++) {
-            Snap.Node n = nodes.get(i);
-            h = 31 * h + (n.txt.isEmpty() ? n.desc : n.txt).hashCode();
-            h = 31 * h + n.l * 7L + n.t;
+            Snap.Node nd = nodes.get(i);
+            String t = nd.txt.isEmpty() ? nd.desc : nd.txt;
+            if (t.isEmpty() && nd.vid.isEmpty()) continue;
+            h = 31 * h + t.hashCode();
+            h = 31 * h + nd.vid.hashCode();
+            n++;
         }
-        return pkgOf(displayId) + "/" + nodes.size() + "/" + Long.toHexString(h);
+        return pkgOf(displayId) + "/" + n + "/" + Long.toHexString(h);
     }
 
     /** Busca en los elementos frescos el equivalente al de la ref. */
