@@ -329,7 +329,10 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 if (x <= 0) x = dm.widthPixels / 2;
                 if (y <= 0) y = (int)(dm.heightPixels * 0.5f);
                 boolean sem = scrollSemantic(x, y, false, d);
-                if (!sem) run(makeScroll(x, y, -0.4f, d), "scrollUp");
+                // Gesto: el dedo baja => el contenido sube (se ven los
+                // anteriores). Antes iba al revés y "scroll up" en una lista
+                // ya arriba no hacía nada.
+                if (!sem) run(makeScroll(x, y, 0.4f, d), "scrollUp");
                 return CpRes.ok(sem ? "scroll up (semántico)" : "scroll up");
             }
             case ACTION_SCROLL_DOWN: {
@@ -340,7 +343,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 if (x <= 0) x = dm.widthPixels / 2;
                 if (y <= 0) y = (int)(dm.heightPixels * 0.5f);
                 boolean sem = scrollSemantic(x, y, true, d);
-                if (!sem) run(makeScroll(x, y, 0.4f, d), "scrollDown");
+                if (!sem) run(makeScroll(x, y, -0.4f, d), "scrollDown");
                 return CpRes.ok(sem ? "scroll down (semántico)" : "scroll down");
             }
             case ACTION_BACK:
@@ -1031,7 +1034,12 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             }
             prev = sig;
             if (!scrollSemantic(-1, -1, true, displayId)) {
-                return CpRes.fail("no se encontró '" + needle + "' y no hay contenedor desplazable");
+                // Muchas apps (MIUI Settings, p.ej.) no marcan su lista como
+                // scrollable en el árbol: sin este respaldo, scrollto se
+                // rendía en la primera pantalla.
+                android.util.DisplayMetrics dm = metricsOf(displayId);
+                run(makeScroll(dm.widthPixels / 2, (int)(dm.heightPixels * 0.6f),
+                        -0.45f, displayId), "scrollTo");
             }
             nap(180);
         }
