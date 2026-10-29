@@ -31,14 +31,22 @@
 #   clear    <app|pkg>          Clear app data/cache
 #   tree                         Dump current UI tree (raw)
 #   snap     [-a] [--filter T]  Snapshot con refs @pN (estilo agent-browser)
-#   tapref   @pN [--settle ms]  Tap on the element of that snap ref
+#   tapref   @pN [--settle ms] [--fast] [--verify[=ms]]
+#                               Tap on the element of that snap ref. Por
+#                               defecto re-resuelve la ref contra el árbol
+#                               VIVO antes de tocar (toolbar que colapsa);
+#                               --fast usa la posición del snapshot.
 #   waitfor  "text" [ms]        Espera a que aparezca un texto (1 solo viaje)
 #   see      [file] [--scale S] Captura JPEG de la pantalla
 #   ocr      "texto" [conf] [--region x,y,w,h]  OCR de la captura: coordenadas de un texto
-#   tap      X Y [ms]           Tap at (X,Y); optional hold duration
+#   tap      X Y [ms] [--verify[=ms]]
+#                               Tap at (X,Y); optional hold duration.
+#                               --verify confirma que la pantalla cambió
+#                               (imprime [cambió] o [sin cambios]).
+#   tapv     X Y [ms]           Alias de `tap --verify`
 #   longpress X Y [ms]          Long-press at (X,Y); default 500ms
 #   swipe    X1 Y1 X2 Y2 [ms]   Swipe/drag
-#   scroll   up|down [x y]      Scroll at position
+#   scroll   up|down [x y]      Scroll at position (sin x/y: centro)
 #   back / home / recents       Botones del sistema
 #   type     <text>             Type text into the focused field (REPLACES it)
 #   type     <text> [ms]        ... con un plazo de espera (por defecto 400)
@@ -48,7 +56,8 @@
 #   openurl  <url> [pkg]       Open URL in browser (default browser or given pkg)
 #   click    "text"             Click UI element by visible text
 #   clickid  resourceId         Click UI element by resource id
-#   scrollto "text"             Scroll to an element with text
+#   scrollto "text" [max]       Scroll hasta un elemento de una lista
+#                               virtualizada (busca, desplaza, repite)
 #   tapshot  X Y [W H]          Tap coords seen in the screenshot PNG (W H = size you saw)
 #   float    <texto> [pkg]      Pon la app en ventana flotante (recents->long-press->MIUI)
 #   presskey <key>               Press a key (back/home/recents only)
@@ -158,6 +167,7 @@ ACTION_DISPLAY="com.accessdroid.termux.ACTION_DISPLAY"
 ACTION_GET_SNAPSHOT="com.accessdroid.termux.ACTION_GET_SNAPSHOT"
 ACTION_TAPREF="com.accessdroid.termux.ACTION_TAPREF"
 ACTION_WAITFOR="com.accessdroid.termux.ACTION_WAITFOR"
+ACTION_TAP_VERIFY="com.accessdroid.termux.ACTION_TAP_VERIFY"
 ACTION_PING="com.accessdroid.termux.ACTION_PING"
 ACTION_ENABLE_SERVICE="com.accessdroid.termux.ACTION_ENABLE_SERVICE"
 ACTION_RESOLVE_PKG="com.accessdroid.termux.ACTION_RESOLVE_PKG"
@@ -550,13 +560,16 @@ cp_sleep_ms() {
 
 # ---- tocar una ref ----
 cmd_tapref() {
-    local ref="${1:-}" settle=""
-    [[ -z "$ref" ]] && { echo "uso: amctl tapref @pN [--settle ms]" >&2; return 2; }
+    local ref="${1:-}" settle="" fast=0 verify=""
+    [[ -z "$ref" ]] && { echo "uso: amctl tapref @pN [--settle ms] [--fast] [--verify[=ms]]" >&2; return 2; }
     shift || true
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --settle) settle="${2:-300}"; shift 2 ;;
             --settle=*) settle="${1#*=}"; shift ;;
+            --fast) fast=1; shift ;;
+            --verify) verify=1500; shift ;;
+            --verify=*) verify="${1#*=}"; shift ;;
             *) shift ;;
         esac
     done
@@ -565,6 +578,8 @@ cmd_tapref() {
     CP_ARGS=""
     cp_arg s ref "$ref"
     cp_arg i display "$DISPLAY_ID"
+    (( fast )) && cp_arg i fast 1
+    [[ -n "$verify" ]] && cp_arg l verify "$verify"
     # el "settle" se lo pide al SERVICIO: si duerme el servidor, el CLI no
     # paga un exec de sleep (150 ms) ni uno de awk para las fracciones.
     [[ -n "$settle" ]] && cp_arg l settle "$settle"
@@ -600,10 +615,50 @@ cmd_waitfor() {
 }
 
 # ---- acciones simples ----
-cmd_tap()        { cp_or_bc $ACTION_TAP $ACTION_TAP "i:x=${1:-0}" "i:y=${2:-0}" "l:duration=${3:-80}"; }
+cmd_tap() {
+    local x="${1:-0}" y="${2:-0}" dur=80 verify=""
+    shift 2 2>/dev/null || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --verify) verify=1500; shift ;;
+            --verify=*) verify="${1#*=}"; shift ;;
+            [0-9]*) dur="$1"; shift ;;
+            *) shift ;;
+        esac
+    done
+    if [[ -n "$verify" ]]; then
+        CP_ARGS=""
+        cp_arg i x "$x"
+        cp_arg i y "$y"
+        cp_arg l duration "$dur"
+        cp_arg l timeout "$verify"
+        if cp_call $ACTION_TAP_VERIFY "$(cp_encode_args)"; then
+            cp_report
+            return $?
+        fi
+        cp_no_channel
+        return 1
+    fi
+    cp_or_bc $ACTION_TAP $ACTION_TAP "i:x=$x" "i:y=$y" "l:duration=$dur"
+}
+cmd_tapv()       { cmd_tap "$@" --verify; }
 cmd_longpress()  { cp_or_bc $ACTION_LONG_PRESS $ACTION_LONG_PRESS "i:x=${1:-0}" "i:y=${2:-0}" "l:duration=${3:-500}"; }
 cmd_swipe()      { cp_or_bc $ACTION_SWIPE $ACTION_SWIPE "i:x1=${1:-0}" "i:y1=${2:-0}" "i:x2=${3:-0}" "i:y2=${4:-0}" "l:duration=${5:-300}"; }
-cmd_scroll()     { local dir="${1:-down}"; if [[ "$dir" == "down" ]]; then cp_or_bc $ACTION_SCROLL_DOWN $ACTION_SCROLL_DOWN "i:x=${2:-0}" "i:y=${3:-0}"; else cp_or_bc $ACTION_SCROLL_UP $ACTION_SCROLL_UP "i:x=${2:-0}" "i:y=${3:-0}"; fi; }
+cmd_scroll()     {
+    # Sin x/y NO se mandan: el servicio pone el centro. Mandar 0,0 hacía que
+    # el gesto empezara en la esquina y acabara en coordenadas negativas.
+    local dir="${1:-down}" x="${2:-}" y="${3:-}"
+    CP_ARGS=""
+    [[ -n "$x" ]] && cp_arg i x "$x"
+    [[ -n "$y" ]] && cp_arg i y "$y"
+    if [[ "$dir" == "down" ]]; then
+        if cp_call $ACTION_SCROLL_DOWN "$(cp_encode_args)"; then cp_report; return $?; fi
+    else
+        if cp_call $ACTION_SCROLL_UP "$(cp_encode_args)"; then cp_report; return $?; fi
+    fi
+    cp_no_channel
+    return 1
+}
 cmd_back()       { cp_or_bc $ACTION_BACK $ACTION_BACK; }
 cmd_home()       { cp_or_bc $ACTION_HOME $ACTION_HOME; }
 cmd_recents()    { cp_or_bc $ACTION_RECENTS $ACTION_RECENTS; }
@@ -613,7 +668,7 @@ cmd_paste()      { cp_or_bc $ACTION_PASTE $ACTION_PASTE; }
 cmd_focus()      { local t="${1:-}"; if [[ -n "$t" ]]; then cp_or_bc $ACTION_FOCUS $ACTION_FOCUS "s:text=$t"; else cp_or_bc $ACTION_FOCUS $ACTION_FOCUS; fi; }
 cmd_click()      { cp_or_bc $ACTION_CLICK_TEXT $ACTION_CLICK_TEXT "s:text=${1:-}"; }
 cmd_clickid()    { cp_or_bc $ACTION_CLICK_ID $ACTION_CLICK_ID "s:id=${1:-}"; }
-cmd_scrollto()   { cp_or_bc $ACTION_SCROLL_TO $ACTION_SCROLL_TO "s:text=${1:-}"; }
+cmd_scrollto()   { cp_or_bc $ACTION_SCROLL_TO $ACTION_SCROLL_TO "s:text=${1:-}" "i:max=${2:-10}"; }
 cmd_presskey()   {
     local k="${1:-}" code=0
     case "$k" in
@@ -1031,10 +1086,11 @@ case "${1:-help}" in
     snap)      shift; cmd_snap "$@" ;;
     tapref)    shift; cmd_tapref "$@" ;;
     waitfor)   shift; cmd_waitfor "$@" ;;
-    tap)       cmd_tap "${2:-0}" "${3:-0}" "${4:-80}" ;;
+    tap)       shift; cmd_tap "$@" ;;
+    tapv)      shift; cmd_tapv "$@" ;;
     longpress) cmd_longpress "${2:-0}" "${3:-0}" "${4:-500}" ;;
     swipe)     cmd_swipe "${2:-0}" "${3:-0}" "${4:-0}" "${5:-0}" "${6:-300}" ;;
-    scroll)    cmd_scroll "${2:-down}" "${3:-0}" "${4:-0}" ;;
+    scroll)    cmd_scroll "${2:-down}" "${3:-}" "${4:-}" ;;
     back)      cmd_back ;;
     home)      cmd_home ;;
     recents)   cmd_recents ;;
@@ -1047,7 +1103,7 @@ case "${1:-help}" in
     tapshot)   cmd_tapshot "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
     click)     cmd_click "${2:-}" ;;
     clickid)   cmd_clickid "${2:-}" ;;
-    scrollto)  cmd_scrollto "${2:-}" ;;
+    scrollto)  shift; cmd_scrollto "${1:-}" "${2:-10}" ;;
     screenshot) shift; cmd_shot "$@" ;;
     shot)      shift; cmd_shot "$@" ;;
     see)       shift; cmd_shot "$@" ;;

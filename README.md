@@ -83,6 +83,8 @@ Además:
 - `amctl waitfor "texto"` espera **dentro** del servicio: el agente no duerme
   a ciegas ni gasta ida y vuelta.
 - `tapref` avisa si la ref quedó obsoleta, en vez de tocar donde no toca.
+- `tap --verify` / `tapref --verify` avisan si el toque no produjo ningún
+  cambio en pantalla (el caso "respondió ok pero no pasó nada").
 - La captura es JPEG (10x más rápido de comprimir y de transferir que PNG).
 - `amctl enable` **re-activa el servicio solo** tras una actualización
   (Android lo desactiva por seguridad): la app tiene `WRITE_SECURE_SETTINGS`
@@ -134,6 +136,9 @@ amctl see      # captura JPEG -> /sdcard/Download/accessdroid-shot.jpg
 |---|---|
 | Ver la pantalla como texto + refs | `amctl snap` |
 | Tocar una referencia | `amctl tapref @p3` |
+| Tocar y confirmar que la pantalla cambió | `amctl tap X Y --verify` · `amctl tapv X Y` |
+| Tocar una ref y confirmar el cambio | `amctl tapref @p3 --verify` |
+| Bajar hasta un elemento de una lista larga | `amctl scrollto "texto"` |
 | Árbol de UI completo | `amctl tree` |
 | Snapshot incluyendo no-interactivos | `amctl snap -a` |
 | Filtrar por texto | `amctl snap --filter "Enviar"` |
@@ -311,4 +316,11 @@ Los íconos se regeneran del logo con `python3 gen-icons.py`
   servicio (fuera el parseo en el móvil), `waitfor` server-side, `tapref` que
   detecta refs obsoletas, capturas en JPEG, trabajo pesado fuera del hilo
   principal (se acabaron los ANR), y sondeo de 50ms en el CLI.
+- **CostPhone v1.4** (taps que no mienten): `tap --verify` / `tapv` compara la
+  firma de la pantalla antes y después y avisa si el toque se perdió,
+  `tapref` re-resuelve **siempre** contra el árbol vivo (toolbar que colapsa,
+  listas que se mueven) y `scrollto` recorre listas virtualizadas buscando el
+  texto, con detección de fin de lista. Además: `scroll` sin coordenadas usa
+  el centro (antes mandaba 0,0 y el gesto reventaba con "Path bounds must not
+  be negative").
 - Licencia: **MIT** — ver [LICENSE](LICENSE).

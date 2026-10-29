@@ -31,6 +31,8 @@ t "tree"         "# pkg="             "$AMCTL" tree
 t "back"         "back"               "$AMCTL" back
 t "home"         "home"               "$AMCTL" home
 t "tap"          "tap"                "$AMCTL" tap 5 5
+t "tapv"         "tap (5,5)"          "$AMCTL" tapv 5 5
+t "tap verify"   "tap (5,5)"          "$AMCTL" tap 5 5 --verify=800
 t "swipe"        "swipe"              "$AMCTL" swipe 100 100 100 200 100
 t "scroll"       "scroll"             "$AMCTL" scroll down
 t "recents"      "recents"            "$AMCTL" recents

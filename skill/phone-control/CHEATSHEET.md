@@ -33,12 +33,12 @@ En un teléfono **cada `exec` de un binario cuesta ~150 ms**: `amctl` es un scri
 | **Árbol crudo** | `amctl tree` | 0.3s | Solo para depurar: formato largo, sin refs |
 | **Click por texto** | `amctl click "Enviar"` | 0.24s | ⚠ ver trampas 1-2 |
 | **Click por id** | `amctl clickid send` | 0.23s | Id corto del snapshot (`#send` → `clickid send`) — **lo más estable** |
-| **Tocar ref** | `amctl tapref @p3 --settle 500` | 0.2s | El settle lo duerme el servidor |
-| **Tocar coordenadas** | `amctl tap X Y [ms]` · `amctl longpress X Y [ms]` | 0.15s | `longpress` = 500 ms por defecto |
+| **Tocar ref** | `amctl tapref @p3 --settle 500` | 0.2s | Re-resuelve contra el árbol vivo (toolbar que colapsa) · nodo SIN texto → `amctl tapshot` · `--verify` confirma que cambió · `--fast` evita el dump |
+| **Tocar coordenadas** | `amctl tap X Y [ms]` · `amctl tapv X Y` · `amctl longpress X Y [ms]` | 0.15s | `tapv` = `tap --verify`: avisa si la pantalla NO cambió (`[sin cambios]`); `longpress` = 500 ms |
 | **Escribir (reemplaza)** | `amctl type "texto" [ms]` | 0.2s | setText **borra** lo anterior; verifica que aparezca |
 | **Vaciar / pegar / enfocar** | `amctl cleartext` · `amctl paste` · `amctl focus "texto"` | 0.2s | `focus` busca texto o descripción |
 | **Scroll semántico** | `amctl scroll down\|up [x y]` | 0.2s | La app desplaza su lista |
-| **Scroll a un texto** | `amctl scrollto "texto"` | 0.2s | Busca y desplaza hasta él |
+| **Scroll a un texto** | `amctl scrollto "texto" 10` | 0.2s×n | Busca → desplaza → repite: sirve con listas virtualizadas |
 | **Swipe bruto** | `amctl swipe X1 Y1 X2 Y2 [ms]` | 0.2s | Para feeds (donde `scroll` falla) |
 | **Back / Home / Recents** | `amctl back` / `amctl home` / `amctl recents` · `amctl presskey back` | 0.15s | `back` sí tiene versión `-d`; los demás son globales |
 | **Varias órdenes (1 proceso)** | `amctl batch "home; back; snap"` | 1 exec | 3 órdenes: 2.2s → 0.44s |
@@ -58,14 +58,15 @@ En un teléfono **cada `exec` de un binario cuesta ~150 ms**: `amctl` es un scri
 | **2. Fila con zonas** | icono navega a A, título a B, mensaje a C | **Nunca `click` por el título**: `tapref` de la fila (`*_row_container`) o `click` del mensaje |
 | **3. Placeholder variable** | `waitfor "Buscar"` expira aunque la barra esté ahí | `waitfor "search_input"` (id **sin** `#`) o `snap --filter "search"` |
 | **4. Overlay tapa el botón** | `clickid send` falla tras abrir el teclado | `snap` **después** del teclado y `tapref` de la ref nueva; `--settle 500` |
-| **5. Lista virtualizada** | `click "X"` dice "no se encontró" aunque X esté en la lista | `scroll down` + `snap --filter` en bucle hasta encontrarlo |
+| **5. Lista virtualizada** | `click "X"` dice "no se encontró" aunque X esté en la lista | `amctl scrollto "X"`: busca/desplaza/repite hasta que la lista lo cree |
 | **6. Texto truncado ("…")** | `click "Texto largo..."` no encuentra match | `click` por substring único sin los puntos, o `tapref` de la fila, o `snap -a` |
 | **7. Loading ≠ vacío** | `waitfor "Cargando"` expira y la lista sigue vacía | Espera a un texto que **solo existe con datos**; si no, `snap -a` y lee el error |
 | **8. Tap y snap juntos** | `tapref && snap` devuelve el snapshot **anterior** | `tapref @pN --settle 500` |
+| **9. Ref de nodo SIN texto** | `tapref` responde `[re-resuelto]` y toca otro nodo (un campo vacío no tiene texto con el que comparar) | `amctl see` → `read` → `amctl tapshot X Y W H`; o `amctl clickid <id>` / `amctl focus "<texto>"` |
+| **10. Snapshot vacío fantasma** | `snap --filter` dice "sin elementos interactivos" pero el `snap -a` completo sí da elementos (carrera con el teclado) | **Reintenta una vez** antes de concluir que el servicio está apagado |
 
-**Cómo elegir el objetivo:** ¿tiene id corto? → `clickid <id>` (lo más
-estable). ¿Texto único y corto? → `click "<texto>"`. ¿Es una fila? →
-`tapref` de la **fila**. ¿Truncado o repetido? → `snap -a` o `tapref`.
+**Cómo elegir el objetivo:** ¿id corto? → `clickid <id>` (lo más estable).
+¿Texto único? → `click "<texto>"`. ¿Fila? → `tapref` de la **fila**. ¿Truncado? → `snap -a`. ¿**Sin texto** (campo vacío)? → `tapshot`/`focus`, nunca `tapref`.
 
 ## 📐 PATRONES POR TIPO DE UI
 
@@ -111,7 +112,7 @@ Con el teclado abierto: `amctl snap` → busca `[ime]` → `tapref @pN` a **Ente
 | Síntoma | Fix |
 |---|---|
 | "canal no disponible" | `amctl enable` |
-| `snap` vacío / sin refs | `amctl enable` → `amctl snap` |
+| `snap` vacío / sin refs | reintenta 1 vez (trampa 10); si sigue: `amctl enable` → `amctl snap` |
 | "ref @pN no existe" / "obsoleta" | `amctl snap` (la pantalla cambió) |
 | Elemento no visible | `amctl scroll down` / `swipe` → `snap` |
 | `click "X"` no hace nada | Trampa 1: `tapref` del nodo más profundo, o `clickid` |

@@ -66,6 +66,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     private static final String ACTION_GET_SNAPSHOT = "com.accessdroid.termux.ACTION_GET_SNAPSHOT";
     private static final String ACTION_TAPREF = "com.accessdroid.termux.ACTION_TAPREF";
     private static final String ACTION_WAITFOR = "com.accessdroid.termux.ACTION_WAITFOR";
+    private static final String ACTION_TAP_VERIFY = "com.accessdroid.termux.ACTION_TAP_VERIFY";
     public static final String ACTION_ENABLE_SERVICE = "com.accessdroid.termux.ACTION_ENABLE_SERVICE";
     private static final String ACTION_RESOLVE_PKG = "com.accessdroid.termux.ACTION_RESOLVE_PKG";
     private static final String ACTION_PING = "com.accessdroid.termux.ACTION_PING";
@@ -266,9 +267,38 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             case ACTION_TAP: {
                 int x = intent.getIntExtra("x", -1);
                 int y = intent.getIntExtra("y", -1);
+                long dur = intent.getLongExtra("duration", 80);
                 if (x < 0 || y < 0) return CpRes.fail("coordenadas inválidas");
-                run(makeTap(x, y, 80L, disp(intent)), "tap");
+                run(makeTap(x, y, dur, disp(intent)), "tap");
                 return CpRes.ok("tap (" + x + "," + y + ")");
+            }
+            case ACTION_TAP_VERIFY: {
+                // Toque + comprobación de que la pantalla reaccionó.
+                // Sin esto, un tap que cae en el vacío devuelve "ok" y el
+                // agente sigue creyendo que navegó. La firma incluye textos
+                // y posiciones, así que también detecta el toolbar que
+                // colapsa (mismos textos, otras coordenadas).
+                int x = intent.getIntExtra("x", -1);
+                int y = intent.getIntExtra("y", -1);
+                long dur = intent.getLongExtra("duration", 80);
+                long timeout = intent.getLongExtra("timeout", 1500);
+                if (x < 0 || y < 0) return CpRes.fail("coordenadas inválidas");
+                int d = disp(intent);
+                String before = uiSignature(d);
+                run(makeTap(x, y, dur, d), "tap");
+                long t0 = System.currentTimeMillis();
+                long limit = Math.max(200, Math.min(timeout, 6000));
+                boolean changed = false;
+                while (System.currentTimeMillis() - t0 < limit) {
+                    nap(60);
+                    if (!before.equals(uiSignature(d))) { changed = true; break; }
+                }
+                long ms = System.currentTimeMillis() - t0;
+                if (changed) {
+                    return CpRes.ok("tap (" + x + "," + y + ") [cambió en " + ms + " ms]");
+                }
+                return CpRes.ok("tap (" + x + "," + y + ") [sin cambios en " + ms
+                        + " ms — tap probablemente perdido]");
             }
             case ACTION_LONG_PRESS: {
                 int x = intent.getIntExtra("x", -1);
@@ -291,8 +321,13 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             case ACTION_SCROLL_UP: {
                 int d = disp(intent);
                 android.util.DisplayMetrics dm = metricsOf(d);
-                int x = intent.getIntExtra("x", dm.widthPixels / 2);
-                int y = intent.getIntExtra("y", (int)(dm.heightPixels * 0.5f));
+                // x/y <= 0 = "no los mandó el cliente": usar el centro.
+                // (Antes el CLI mandaba 0,0 siempre y el gesto acababa con
+                // coordenadas negativas: "Path bounds must not be negative").
+                int x = intent.getIntExtra("x", -1);
+                int y = intent.getIntExtra("y", -1);
+                if (x <= 0) x = dm.widthPixels / 2;
+                if (y <= 0) y = (int)(dm.heightPixels * 0.5f);
                 boolean sem = scrollSemantic(x, y, false, d);
                 if (!sem) run(makeScroll(x, y, -0.4f, d), "scrollUp");
                 return CpRes.ok(sem ? "scroll up (semántico)" : "scroll up");
@@ -300,8 +335,10 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             case ACTION_SCROLL_DOWN: {
                 int d = disp(intent);
                 android.util.DisplayMetrics dm = metricsOf(d);
-                int x = intent.getIntExtra("x", dm.widthPixels / 2);
-                int y = intent.getIntExtra("y", (int)(dm.heightPixels * 0.5f));
+                int x = intent.getIntExtra("x", -1);
+                int y = intent.getIntExtra("y", -1);
+                if (x <= 0) x = dm.widthPixels / 2;
+                if (y <= 0) y = (int)(dm.heightPixels * 0.5f);
                 boolean sem = scrollSemantic(x, y, true, d);
                 if (!sem) run(makeScroll(x, y, 0.4f, d), "scrollDown");
                 return CpRes.ok(sem ? "scroll down (semántico)" : "scroll down");
@@ -390,12 +427,7 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             case ACTION_SCROLL_TO: {
                 String txt = intent.getStringExtra("text");
                 if (txt == null || txt.isEmpty()) return CpRes.fail("texto vacío");
-                AccessibilityNodeInfo root = rootFor(disp(intent));
-                if (root == null) return CpRes.fail("no hay ventana activa");
-                AccessibilityNodeInfo target = findByText(root, txt);
-                if (target == null) return CpRes.fail("no se encontró el texto '" + txt + "'");
-                boolean ok = target.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
-                return ok ? CpRes.ok("scroll hasta '" + txt + "'") : CpRes.fail("no se pudo hacer scroll hasta '" + txt + "'");
+                return scrollUntil(txt, disp(intent), intent.getIntExtra("max", 10));
             }
             case ACTION_GET_UI_TREE: {
                 int d = disp(intent);
@@ -440,7 +472,9 @@ public class AccessibilityServiceImpl extends AccessibilityService {
                 String ref = intent.getStringExtra("ref");
                 if (ref == null || ref.isEmpty()) return CpRes.fail("ref vacío");
                 long settle = intent.getLongExtra("settle", 0);
-                return tapRef(ref, disp(intent), settle);
+                boolean fast = intent.getIntExtra("fast", 0) == 1;
+                long verify = intent.getLongExtra("verify", 0);
+                return tapRef(ref, disp(intent), settle, fast, verify);
             }
             case ACTION_WAITFOR: {
                 // Espera a que aparezca un elemento: el bucle va en el servicio,
@@ -768,8 +802,20 @@ public class AccessibilityServiceImpl extends AccessibilityService {
      * reutiliza), y el sondeo del waitfor es casi gratis.
      */
     private void collect(int displayId, List<Snap.Node> out, long deadline) {
+        collect(displayId, out, deadline, false);
+    }
+
+    /**
+     * Igual que {@link #collect}, pero con `force` se salta la caché.
+     *
+     * uiSignature() lo necesita: si la app no emite eventos de accesibilidad
+     * (DocumentsUI es el caso clásico), uiVersion no cambia y la caché
+     * devolvería el mismo árbol, con lo que un tap que SÍ funcionó se
+     * reportaría como "sin cambios". Para verificar hay que mirar de verdad.
+     */
+    private void collect(int displayId, List<Snap.Node> out, long deadline, boolean force) {
         TreeCache cache = treeCache;
-        if (cache != null && cache.display == displayId && cache.version == uiVersion) {
+        if (!force && cache != null && cache.display == displayId && cache.version == uiVersion) {
             out.addAll(cache.nodes);
             return;
         }
@@ -858,12 +904,15 @@ public class AccessibilityServiceImpl extends AccessibilityService {
     /**
      * Toca la referencia @pN del último snapshot.
      *
-     * Si la UI no ha cambiado desde el snapshot, se toca directamente la
-     * posición conocida (una orden, sin recorrer el árbol). Si ha cambiado, se
-     * busca el elemento equivalente en el árbol actual; si ya no existe, se
-     * avisa en vez de tocar una posición equivocada.
+     * Antes solo se re-resolvía cuando `uiDirty` estaba puesto, y varias apps
+     * (DocumentsUI es el caso típico) no emiten eventos al colapsar el
+     * toolbar: la ref seguía "limpia" con coordenadas viejas y el tap caía
+     * una fila más abajo. Ahora, por defecto, se vuelve a resolver el
+     * elemento contra el árbol VIVO antes de tocar; `fast` recupera el atajo.
+     *
+     * Si el elemento ya no existe, se falla en vez de tocar a ciegas.
      */
-    private CpRes tapRef(String ref, int displayId, long settleMs) {
+    private CpRes tapRef(String ref, int displayId, long settleMs, boolean fast, long verifyMs) {
         if (ref.startsWith("@")) ref = ref.substring(1);
         if (!ref.startsWith("p")) ref = "p" + ref;
         RefCache cache = refCache;
@@ -884,10 +933,9 @@ public class AccessibilityServiceImpl extends AccessibilityService {
 
         int x = pick.node.cx();
         int y = pick.node.cy();
-        boolean resolved = false;
+        String note = "";
 
-        if (uiDirty) {
-            // La pantalla ha cambiado: re-buscamos el mismo elemento.
+        if (!fast) {
             List<Snap.Node> nodes = new ArrayList<>();
             collect(displayId, nodes, System.currentTimeMillis() + DUMP_BUDGET_MS);
             if (nodes.isEmpty()) {
@@ -896,35 +944,142 @@ public class AccessibilityServiceImpl extends AccessibilityService {
             List<Snap.Pick> fresh = Snap.select(nodes, cache.allMode, null);
             Snap.Pick best = matchPick(pick, fresh);
             if (best == null) {
-                return CpRes.fail("ref @" + ref + " obsoleta (la pantalla cambió) — re-snapshot");
+                return CpRes.fail("ref @" + ref + " ya no está en pantalla (la UI cambió)"
+                        + " — re-snapshot antes de tocar");
             }
-            x = best.node.cx();
-            y = best.node.cy();
-            resolved = true;
+            int nx = best.node.cx();
+            int ny = best.node.cy();
+            if (nx != x || ny != y) {
+                note = " [re-resuelto " + (nx - x >= 0 ? "+" : "") + (nx - x)
+                        + "," + (ny - y >= 0 ? "+" : "") + (ny - y) + "]";
+            }
+            x = nx;
+            y = ny;
         }
 
+        String before = verifyMs > 0 ? uiSignature(displayId) : null;
         run(makeTap(x, y, 80L, displayId), "tapref");
         // El "settle" se duerme AQUI, no en el cliente: si el CLI tuviera que
         // dormir, pagaría un exec de 'sleep' (~150 ms en un teléfono).
         if (settleMs > 0) nap(Math.min(settleMs, 3000));
-        return CpRes.ok("tap @" + ref + " -> (" + x + "," + y + ")"
-                + (resolved ? " [re-resuelto]" : "")
+
+        if (verifyMs > 0) {
+            long t0 = System.currentTimeMillis();
+            long limit = Math.max(200, Math.min(verifyMs, 6000));
+            boolean changed = false;
+            while (System.currentTimeMillis() - t0 < limit) {
+                nap(60);
+                if (!before.equals(uiSignature(displayId))) { changed = true; break; }
+            }
+            note += changed
+                    ? " [cambió en " + (System.currentTimeMillis() - t0) + " ms]"
+                    : " [sin cambios — tap probablemente perdido]";
+        }
+
+        return CpRes.ok("tap @" + ref + " -> (" + x + "," + y + ")" + note
                 + (settleMs > 0 ? " [settled " + settleMs + "]" : ""));
+    }
+
+    /**
+     * Firma barata de la pantalla: textos + posiciones + ids.
+     *
+     * Sirve para dos cosas: saber si un tap hizo algo, y saber si un scroll
+     * movió de verdad la lista (fin de lista). Incluye `top`/`left`, así que
+     * detecta el caso que rompía los taps: mismos textos, otras coordenadas
+     * (toolbar que colapsa, banner que aparece, lista que se desplaza).
+     */
+    private String uiSignature(int displayId) {
+        List<Snap.Node> nodes = new ArrayList<>();
+        collect(displayId, nodes, System.currentTimeMillis() + 1500, true);
+        long h = 1125899906842597L;
+        for (int i = 0; i < nodes.size(); i++) {
+            Snap.Node n = nodes.get(i);
+            h = 31 * h + n.depth;
+            h = 31 * h + (n.txt.isEmpty() ? n.desc : n.txt).hashCode();
+            h = 31 * h + n.vid.hashCode();
+            h = 31 * h + n.l * 7L + n.t;
+        }
+        return pkgOf(displayId) + "/" + nodes.size() + "/" + Long.toHexString(h);
+    }
+
+    /**
+     * Desplaza la lista hasta que aparezca `needle` (o hasta el final).
+     *
+     * Hace falta porque las listas de Android son virtualizadas: el elemento
+     * que buscas muchas veces no existe en el árbol hasta que la lista lo
+     * crea. Buscar una sola vez y rendirse (lo que hacía antes) fallaba con
+     * cualquier lista larga.
+     */
+    private CpRes scrollUntil(String needle, int displayId, int maxScrolls) {
+        int max = Math.max(1, Math.min(maxScrolls, 40));
+        String prev = null;
+        for (int i = 0; i <= max; i++) {
+            List<Snap.Node> nodes = new ArrayList<>();
+            collect(displayId, nodes, System.currentTimeMillis() + DUMP_BUDGET_MS, true);
+            if (nodes.isEmpty()) return CpRes.fail("no hay ventana activa");
+            Snap.Index idx = Snap.index(nodes);
+            int hit = Snap.findMatch(idx, needle);
+            if (hit >= 0) {
+                Snap.Node nd = nodes.get(hit);
+                return CpRes.ok("scroll hasta '" + needle + "' -> (" + nd.cx() + "," + nd.cy()
+                        + ") tras " + i + " scroll(s)");
+            }
+            String sig = sigOf(nodes, displayId);
+            if (sig.equals(prev)) {
+                return CpRes.fail("no se encontró '" + needle + "': fin de la lista tras "
+                        + i + " scroll(s)");
+            }
+            prev = sig;
+            if (!scrollSemantic(-1, -1, true, displayId)) {
+                return CpRes.fail("no se encontró '" + needle + "' y no hay contenedor desplazable");
+            }
+            nap(180);
+        }
+        return CpRes.fail("no se encontró '" + needle + "' tras " + max + " scroll(s)");
+    }
+
+    private String sigOf(List<Snap.Node> nodes, int displayId) {
+        long h = 1125899906842597L;
+        for (int i = 0; i < nodes.size(); i++) {
+            Snap.Node n = nodes.get(i);
+            h = 31 * h + (n.txt.isEmpty() ? n.desc : n.txt).hashCode();
+            h = 31 * h + n.l * 7L + n.t;
+        }
+        return pkgOf(displayId) + "/" + nodes.size() + "/" + Long.toHexString(h);
     }
 
     /** Busca en los elementos frescos el equivalente al de la ref. */
     private Snap.Pick matchPick(Snap.Pick old, List<Snap.Pick> fresh) {
         Snap.Pick byLabel = null;
         Snap.Pick byId = null;
+        Snap.Pick byPrefix = null;
         for (Snap.Pick p : fresh) {
             boolean sameLabel = p.label.equals(old.label);
             boolean sameId = !old.node.vid.isEmpty() && old.node.vid.equals(p.node.vid);
             if (sameLabel && sameId) return p;
             if (sameId && byId == null) byId = p;
             if (sameLabel && byLabel == null) byLabel = p;
+            // Filas con hora o contador ("2. Actividad .pdf · 12:03") cambian
+            // de etiqueta entre dumps: el prefijo sigue identificándolas.
+            if (byPrefix == null && old.label.length() >= 8
+                    && p.label.startsWith(old.label.substring(0, 8))) {
+                byPrefix = p;
+            }
         }
         if (byId != null) return byId;
         if (byLabel != null) return byLabel;
+        if (byPrefix != null) return byPrefix;
+        // Último recurso: el elemento más cercano al punto anterior. Solo si
+        // está a menos de media pantalla, para no tocar "lo que sea".
+        Snap.Pick near = null;
+        long bestD = Long.MAX_VALUE;
+        for (Snap.Pick p : fresh) {
+            int dx = p.node.cx() - old.node.cx();
+            int dy = p.node.cy() - old.node.cy();
+            long dist = (long) dx * dx + (long) dy * dy;
+            if (dist < bestD) { bestD = dist; near = p; }
+        }
+        if (near != null && bestD <= 400L * 400L) return near;
         return null;
     }
 
@@ -1464,9 +1619,14 @@ public class AccessibilityServiceImpl extends AccessibilityService {
         // vertical scroll gesture: from center, flick (negative = scroll content down)
         android.util.DisplayMetrics dm = metricsOf(displayId);
         long dy = (long)(dm.heightPixels * fraction);
+        // Clamp a la pantalla: un Path con coordenadas negativas lanza
+        // "IllegalArgumentException: Path bounds must not be negative".
+        long y1 = Math.max(4, Math.min(dm.heightPixels - 4, cy));
+        long y2 = Math.max(4, Math.min(dm.heightPixels - 4, cy + dy));
+        long x  = Math.max(4, Math.min(dm.widthPixels - 4, cx));
         Path p = new Path();
-        p.moveTo(cx, cy);
-        p.lineTo(cx, cy + dy);
+        p.moveTo(x, y1);
+        p.lineTo(x, y2);
         return build(java.util.Arrays.asList(new GestureDescription.StrokeDescription(p, 0, 200)), displayId);
     }
 

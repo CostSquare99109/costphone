@@ -74,7 +74,7 @@ iteraciones, p50).
 | `tap`, `longpress`, `swipe`, `scroll`, `back`, `home`, `recents` | 0.15-0.3s | vuelan y no devuelven nada que leer |
 | `click "texto"`, `clickid <id>`, `type`, `focus`, `paste` | 0.2-0.3s | el servicio confirma si funcionó |
 | `snap`, `tree` | 0.22-0.27s | vuelca la pantalla; usa `--filter` si hay mucho |
-| `tapref` | 0.2-0.3s | re-resuelve la ref en el servidor (evita el toque en sitio equivocado) |
+| `tapref` | 0.2-0.3s | re-resuelve la ref en el servidor (evita el toque en sitio equivocado) — **solo si el nodo tiene texto o id**: un nodo vacío no se puede re-resolver (trampa 9) |
 | `see` (captura) | 0.7s | solo si de verdad necesitas la imagen |
 | `launch` | 0.29s | por nombre: `launch whatsapp` (lo resuelve la app) |
 | `waitfor` | lo que tarde el elemento | mejor que cualquier `sleep` |
@@ -120,7 +120,7 @@ Para una web, el paso 2 es `amctl openurl "<url>"` en vez de `launch` (Chrome
 restaura la sesión anterior si lo lanzas a pelo).
 
 **Antes de actuar, consulta [🧠 TRAMPAS UNIVERSALES](#-trampas-universales-y-patrones-por-tipo-de-ui)**:
-ahí está el "cómo elijo el objetivo" y las 8 trampas que se repiten en *toda*
+ahí está el "cómo elijo el objetivo" y las 10 trampas que se repiten en *toda*
 app Android. Aplicar los patrones es lo que separa un agente que funciona en
 WhatsApp de uno que funciona en cualquier app.
 
@@ -141,6 +141,13 @@ acción por ref: re-snapshot.
 directamente; si ha cambiado, busca el mismo elemento y, si ya no existe,
 contesta **"obsoleta — re-snapshot"** en vez de tocar una posición equivocada.
 Si te dice eso, `amctl snap` y sigue.
+
+⚠ **Un nodo SIN texto no es re-resoluble.** La re-resolución busca por texto o
+id: si el elemento no tiene texto (un `EditText` **vacío**, por ejemplo), no hay
+con qué compararlo y `tapref` puede acabar tocando **otro nodo** (se vio:
+`tap @p71 -> (2,180) [re-resuelto]` cuando el campo era un textarea vacío).
+Para esos nodos: `amctl clickid <id>`, `amctl focus "<texto visible>"` o
+`amctl tapshot X Y W H` sobre la captura (trampa 9).
 
 ## Leer la pantalla
 
@@ -163,9 +170,13 @@ sistema). Ya no hay que adivinar coordenadas del teclado: Enter y ⌫ son refs.
 
 | Comando | Qué hace |
 |---|---|
-| `amctl tapref @p3` | Toca el centro del elemento (ref del último snap) |
+| `amctl tapref @p3` | Toca el centro del elemento (ref del último snap). **Siempre re-resuelve contra el árbol vivo** antes de tocar: si el toolbar colapsó o la lista se movió, toca donde está ahora y lo dice (`[re-resuelto +0,-46]`) |
 | `amctl tapref @p3 --settle 500` | Idem + espera a que la pantalla se asiente |
+| `amctl tapref @p3 --fast` | Sin re-resolver: toca la posición del snapshot. Solo si la pantalla no ha cambiado |
+| `amctl tapref @p3 --verify` | Idem + confirma que la pantalla cambió (`[cambió en 240 ms]` / `[sin cambios — tap probablemente perdido]`) |
 | `amctl tap X Y` | Toque crudo en coordenadas (p.ej. de `snap -a`) |
+| `amctl tap X Y --verify[=ms]` | Toque crudo **con confirmación**: avisa si la pantalla no reaccionó. Un tap perdido deja de ser invisible |
+| `amctl tapv X Y [ms]` | Alias corto de `amctl tap X Y --verify` |
 | `amctl tapshot X Y [W H]` | Toca coords vistas en la captura (W H = tamaño con el que viste la imagen); escalea a coords reales |
 | `amctl longpress X Y [ms]` | Pulsación larga |
 | `amctl swipe X1 Y1 X2 Y2 [ms]` | Deslizar/arrastrar |
@@ -180,12 +191,13 @@ sistema). Ya no hay que adivinar coordenadas del teclado: Enter y ⌫ son refs.
 | `amctl float <texto> [pkg]` | Pon la app en ventana flotante (recents → long-press → "ventanas flotantes" de MIUI). `float X pkg Y split` = pantalla dividida |
 | `amctl back` / `amctl home` / `amctl recents` | Botones del sistema |
 | `amctl launch <pkg>` | Abre app |
-| `amctl scrollto "texto"` | Busca y hace scroll a un texto |
+| `amctl scrollto "texto" [max]` | Recorre la lista hasta encontrar el texto: busca → desplaza → vuelve a buscar (hasta `max`, por defecto 10). Funciona con listas **virtualizadas**, donde el elemento no existe en el árbol hasta que la lista lo crea |
+| `amctl scroll down` | Sin coordenadas usa el centro de la pantalla (si pasas `x y`, usa ese punto) |
 
 **Cuidado con el orden tap → snap:** el gesto tarda ~80ms y la app tarda en
 reaccionar. Si encadenas `tapref && snap` en la misma llamada, el snapshot
-puede salir **antes** del cambio. Usa `amctl tapref @p3 --settle 500` o mete un
-`; sleep 0.5` entre el tap y el snap.
+puede salir **antes** del cambio. Usa `amctl tapref @p3 --settle 500` o
+`--verify` (espera a que la pantalla cambie de verdad, sin dormir a ciegas).
 
 Para escribir: `tapref` al campo `[edt]` (o `clickid ...entry`) → `amctl type`
 → `tapref` al botón enviar (`'Enviar'` / `#send`) → `snap` para verificar.
@@ -233,7 +245,7 @@ Antes de tocar nada, mira el `snap` y decide:
 4. **¿El texto sale truncado o repetido?**
    → `amctl snap -a` para ver el texto completo, o `tapref` sobre la fila.
 
-## ⚠️ Las 8 trampas universales
+## ⚠️ Las 10 trampas universales
 
 ### 1. El nodo que "contiene" el texto es un contenedor
 - **Síntoma:** `click "texto"` no hace nada, o abre un **detalle o un menú** en
@@ -314,6 +326,40 @@ Antes de tocar nada, mira el `snap` y decide:
   posterior). El settle lo duerme el servidor.
 - **Apps:** todas.
 
+### 9. `tapref` que se re-resuelve a un nodo equivocado
+- **Síntoma:** `amctl tapref @pN` responde `tap @pN -> (2,180) [re-resuelto]`
+  y toca algo que **no** es el elemento. Pasó con un `EditText` **vacío** (el
+  textarea de "Respuesta automática" del Administrador de anuncios de Meta):
+  sin texto, la re-resolución no tiene con qué comparar y se agarra a otro
+  nodo. El toque "funciona" y por eso es peor: creas que estás en el sitio
+  correcto.
+- **Fix:** una ref de nodo **sin texto** no se toca con `tapref`. Usa
+  `amctl clickid <id>` si tiene id, `amctl focus "<texto visible>"` si tiene
+  etiqueta, o **`amctl tapshot X Y W H`** sobre la captura (`amctl see` +
+  `read`): en un WebView las coordenadas del árbol vienen duplicadas y la
+  foto es la única verdad. Y añade `--verify`: si el toque cae en el sitio
+  equivocado pero no cambia nada, te lo dice.
+- **Apps:** formularios web (React), todo campo vacío, Meta Ads Manager.
+
+### 9b. El tap "funciona" pero no pasó nada
+- **Síntoma:** `amctl tap X Y` responde `ok` y la pantalla sigue igual. En
+  DocumentsUI (el selector de archivos de Android) los taps sobre carpetas a
+  veces no navegaban: el gesto se pierde y no hay error.
+- **Fix:** `amctl tap X Y --verify` (o `amctl tapv X Y`): toca y espera a
+  que la firma de la pantalla cambie; si no cambia, imprime `[sin cambios]`
+  en vez de dejarte creer que navegaste. Si es una ref, `tapref @pN --verify`.
+- **Apps:** DocumentsUI, WebViews, cualquier lista que recarga contenido.
+
+### 10. Snapshot vacío fantasma
+- **Síntoma:** `amctl snap -a --filter "..."` responde *"sin elementos
+  interactivos (¿servicio activado / app >= v1.0.8?)"* y, 300 ms después, el
+  `snap -a` completo devuelve 195 elementos. Es una **carrera** con la
+  animación del teclado o con el volcado del árbol, **no** un servicio apagado.
+  El mensaje asusta: hace creer que hay que ir a Ajustes.
+- **Fix:** **reintenta una vez** antes de concluir nada. Si tras el reintento
+  sigue vacío, entonces sí: `amctl enable` y `amctl snap`.
+- **Apps:** todas; es típica justo después de abrir el teclado.
+
 ## 📐 Patrones por tipo de UI (plantillas)
 
 ### A. Lista maestra → detalle (chats, correos, notificaciones, settings)
@@ -374,6 +420,11 @@ amctl tapshot X Y W H                            # toca lo que viste en la captu
 **Regla:** si el texto no sale en `snap`, no existe para el árbol: o es un
 `WebView` (el texto vive en el DOM, no en la accesibilidad), o es un canvas.
 Ahí el camino es OCR + `tapshot`. Con `--region` el OCR baja de ~19 s a ~2,6 s.
+**Cuidado en formularios de WebView** (Administrador de anuncios de Meta): las
+coordenadas del árbol vienen **duplicadas** (ocho nodos en `(1080,110)`), así
+que un `tapref` puede acertar el nodo y tocar el lugar equivocado. En esos
+formularios la fuente de verdad es la **captura**: `amctl see` → `read` →
+`amctl tapshot X Y W H` (escala sola).
 **Apps:** X/Twitter web, Instagram web, Biblioteca de Anuncios de Meta,
 Feeds y listas de cualquier WebView.
 
@@ -508,8 +559,12 @@ Detalle completo y límites: `docs/pantalla-virtual.md` en el repo de CostPhone.
   Accesibilidad** y avisa de que hay que activar el interruptor).
 - "canal no disponible" → el servicio está apagado: `amctl enable` y reintenta.
   (`amctl status` lo dice en una línea.)
-- `snap` vacío o sin refs → servicio apagado: `amctl enable`, luego `amctl snap`.
+- `snap` vacío o sin refs → **reintenta una vez**: puede ser una carrera con
+  la animación del teclado (trampa 10). Si sigue vacío, servicio apagado:
+  `amctl enable`, luego `amctl snap`.
 - "ref @pN no existe" o "obsoleta" → la pantalla cambió: `amctl snap` de nuevo.
+- `tapref` tocó un nodo raro (`[re-resuelto]` con coords que no cuadran) → el
+  nodo no tenía texto: usa `amctl tapshot` sobre la captura (trampa 9).
 - Elemento no visible → `amctl scroll down` / `swipe` y re-snap.
 - Play Protect bloquea instalar APKs propios ("Aplicación bloqueada") → tocar
   Entendido y reintentar, o desactivar temporalmente el análisis en Play Store
@@ -574,3 +629,22 @@ amctl snap --filter "Hola" -a               # verificar la burbuja enviada
 Notas del caso real: el `type` **reemplaza** el contenido del campo, así que
 para escribir un número en un buscador que ya tenía texto, `type` vale.
 El contacto del ejemplo era el propio número ("+57 310 4618120 (Tú)").
+
+### WebView con coords duplicadas (Administrador de anuncios de Meta)
+
+Formulario de "Conversaciones" de un anuncio: panel de preguntas frecuentes con
+un `EditText` por pregunta y otro por su respuesta automática.
+
+```bash
+amctl snap -a                      # 120 nodos; los ids vienen obfuscated (js_qb…)
+amctl see                           # la foto: única fuente de posición real
+amctl tapshot 150 638 432 960      # coords de la FOTO → el servicio las escala
+amctl type "texto con acentos y saltos de línea"   # setText SÍ funciona en el textarea web
+amctl see                           # verificar: el texto aparece en el textarea
+```
+
+| Atajo | Qué pasa | ✅ Lo que funciona |
+|---|---|---|
+| `tapref` sobre el campo de respuesta (vacío) | se re-resuelve a otro nodo (`(2,180)`) y escribe en el sitio incorrecto | `amctl see` → `read` → `amctl tapshot X Y W H` (trampa 9) |
+| `snap --filter "EditText"` | "sin elementos interactivos" | `amctl snap -a` completo: el filtro no ve campos **sin texto** (trampa 10) |
+| `type "<texto multilínea>"` | — | `amctl type` **sí** acepta `setText` en el textarea web: acentos, `•` y `\n` entran de una vez; verifica con `see` |
